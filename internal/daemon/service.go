@@ -2,13 +2,13 @@ package daemon
 
 import (
 	"context"
-	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/janekbaraniewski/openusage/internal/telemetry"
 )
@@ -103,165 +103,9 @@ func (m ServiceManager) InstallHint() string {
 	return "openusage telemetry daemon install"
 }
 
-func (m ServiceManager) Install() error {
-	switch m.Kind {
-	case "darwin":
-		return m.installLaunchd()
-	case "linux":
-		return m.installSystemdUser()
-	default:
-		return fmt.Errorf("daemon service install is unsupported on %s", runtime.GOOS)
-	}
-}
-
-func (m ServiceManager) Uninstall() error {
-	switch m.Kind {
-	case "darwin":
-		return m.uninstallLaunchd()
-	case "linux":
-		return m.uninstallSystemdUser()
-	default:
-		return fmt.Errorf("daemon service uninstall is unsupported on %s", runtime.GOOS)
-	}
-}
-
-func (m ServiceManager) Start() error {
-	switch m.Kind {
-	case "darwin":
-		return m.startLaunchd()
-	case "linux":
-		_, err := RunCommand("systemctl", "--user", "start", SystemdDaemonUnit)
-		return err
-	default:
-		return fmt.Errorf("daemon service start is unsupported on %s", runtime.GOOS)
-	}
-}
-
 func (m ServiceManager) domainCandidates() []string {
 	uid := fmt.Sprintf("%d", os.Getuid())
 	return []string{"gui/" + uid, "user/" + uid}
-}
-
-func (m ServiceManager) installLaunchd() error {
-	if err := os.MkdirAll(filepath.Dir(m.unitPath), 0o755); err != nil {
-		return fmt.Errorf("create launch agents dir: %w", err)
-	}
-	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
-		return fmt.Errorf("create telemetry state dir: %w", err)
-	}
-
-	stdoutPath := filepath.Join(m.stateDir, "daemon.stdout.log")
-	stderrPath := filepath.Join(m.stateDir, "daemon.stderr.log")
-	content := launchdPlist(m.exePath, m.socketPath, stdoutPath, stderrPath)
-	if err := os.WriteFile(m.unitPath, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("write launchd plist: %w", err)
-	}
-
-	var lastErr error
-	for _, domain := range m.domainCandidates() {
-		_, _ = RunCommand("launchctl", "bootout", domain+"/"+LaunchdDaemonLabel)
-		if _, err := RunCommand("launchctl", "bootstrap", domain, m.unitPath); err != nil {
-			lastErr = err
-			continue
-		}
-		if _, err := RunCommand("launchctl", "kickstart", "-k", domain+"/"+LaunchdDaemonLabel); err != nil {
-			lastErr = err
-			continue
-		}
-		return nil
-	}
-	if lastErr != nil {
-		return lastErr
-	}
-	return fmt.Errorf("launchd bootstrap failed")
-}
-
-func (m ServiceManager) uninstallLaunchd() error {
-	var lastErr error
-	for _, domain := range m.domainCandidates() {
-		_, err := RunCommand("launchctl", "bootout", domain+"/"+LaunchdDaemonLabel)
-		if err != nil {
-			if isLaunchctlNoSuchProcess(err) {
-				continue
-			}
-			lastErr = err
-		}
-	}
-	if err := os.Remove(m.unitPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove launchd plist: %w", err)
-	}
-	if lastErr != nil {
-		return lastErr
-	}
-	return nil
-}
-
-func isLaunchctlNoSuchProcess(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(msg, "no such process") || strings.Contains(msg, "boot-out failed: 3")
-}
-
-func (m ServiceManager) startLaunchd() error {
-	var lastErr error
-	for _, domain := range m.domainCandidates() {
-		if _, err := RunCommand("launchctl", "kickstart", "-k", domain+"/"+LaunchdDaemonLabel); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-	}
-	if !m.IsInstalled() {
-		return fmt.Errorf("launchd service is not installed")
-	}
-	var bootstrapErr error
-	for _, domain := range m.domainCandidates() {
-		if _, err := RunCommand("launchctl", "bootstrap", domain, m.unitPath); err != nil {
-			bootstrapErr = err
-			continue
-		}
-		if _, err := RunCommand("launchctl", "kickstart", "-k", domain+"/"+LaunchdDaemonLabel); err == nil {
-			return nil
-		} else {
-			bootstrapErr = err
-		}
-	}
-	if bootstrapErr != nil {
-		return bootstrapErr
-	}
-	return lastErr
-}
-
-func (m ServiceManager) installSystemdUser() error {
-	if err := os.MkdirAll(filepath.Dir(m.unitPath), 0o755); err != nil {
-		return fmt.Errorf("create systemd user dir: %w", err)
-	}
-	if err := os.MkdirAll(m.stateDir, 0o755); err != nil {
-		return fmt.Errorf("create telemetry state dir: %w", err)
-	}
-
-	content := systemdUnit(m.exePath, m.socketPath)
-	if err := os.WriteFile(m.unitPath, []byte(content), 0o644); err != nil {
-		return fmt.Errorf("write systemd unit: %w", err)
-	}
-	if _, err := RunCommand("systemctl", "--user", "daemon-reload"); err != nil {
-		return err
-	}
-	if _, err := RunCommand("systemctl", "--user", "enable", "--now", SystemdDaemonUnit); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (m ServiceManager) uninstallSystemdUser() error {
-	_, _ = RunCommand("systemctl", "--user", "disable", "--now", SystemdDaemonUnit)
-	if err := os.Remove(m.unitPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove systemd unit: %w", err)
-	}
-	_, _ = RunCommand("systemctl", "--user", "daemon-reload")
-	return nil
 }
 
 func RunCommand(name string, args ...string) (string, error) {
@@ -275,59 +119,6 @@ func RunCommand(name string, args ...string) (string, error) {
 		return trimmed, fmt.Errorf("%s %s failed: %w", name, strings.Join(args, " "), err)
 	}
 	return trimmed, nil
-}
-
-func launchdPlist(exePath, socketPath, stdoutPath, stderrPath string) string {
-	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>%s</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>%s</string>
-		<string>telemetry</string>
-		<string>daemon</string>
-		<string>--socket-path</string>
-		<string>%s</string>
-	</array>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<true/>
-	<key>StandardOutPath</key>
-	<string>%s</string>
-	<key>StandardErrorPath</key>
-	<string>%s</string>
-</dict>
-</plist>
-`, LaunchdDaemonLabel, xmlEscape(exePath), xmlEscape(socketPath), xmlEscape(stdoutPath), xmlEscape(stderrPath))
-}
-
-func systemdUnit(exePath, socketPath string) string {
-	return fmt.Sprintf(`[Unit]
-Description=OpenUsage Telemetry Daemon
-After=default.target
-
-[Service]
-Type=simple
-ExecStart=%s telemetry daemon --socket-path %s
-Restart=always
-RestartSec=2
-WorkingDirectory=%%h
-
-[Install]
-WantedBy=default.target
-`, exePath, socketPath)
-}
-
-func xmlEscape(in string) string {
-	var b strings.Builder
-	if err := xml.EscapeText(&b, []byte(in)); err != nil {
-		return in
-	}
-	return b.String()
 }
 
 func InstallService(socketPath string) error {
@@ -352,29 +143,184 @@ func UninstallService(socketPath string) error {
 	return manager.Uninstall()
 }
 
-func ServiceStatus(socketPath string) error {
+func ServiceStatus(socketPath string, details bool) error {
+	socketPath = strings.TrimSpace(socketPath)
 	manager, err := NewServiceManager(socketPath)
 	if err != nil {
 		return err
 	}
-	client := NewClient(socketPath)
-	health, healthErr := client.HealthInfo(context.Background())
 
-	fmt.Printf("daemon kind=%s installed=%t running=%t socket=%s\n",
-		manager.Kind,
-		manager.IsInstalled(),
-		healthErr == nil,
-		socketPath,
-	)
+	supported := manager.IsSupported()
+	installed := manager.IsInstalled()
+	exePath := strings.TrimSpace(manager.exePath)
+	exeExists := false
+	if _, statErr := os.Stat(exePath); statErr == nil {
+		exeExists = true
+	}
+
+	client := NewClient(socketPath)
+	healthCtx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	health, healthErr := client.HealthInfo(healthCtx)
+
+	fmt.Println("Telemetry Daemon Status")
+	fmt.Printf("  Manager: %s (supported: %s)\n", manager.Kind, yesNo(supported))
+	fmt.Printf("  Installed: %s\n", yesNo(installed))
+	fmt.Printf("  Running: %s\n", yesNo(healthErr == nil))
+	fmt.Printf("  Socket: %s\n", socketPath)
+	fmt.Printf("  Unit file: %s\n", valueOrNA(strings.TrimSpace(manager.unitPath)))
+	fmt.Printf("  Executable: %s\n", valueOrNA(exePath))
+	fmt.Printf("  Executable exists: %s\n", yesNo(exeExists))
+	fmt.Printf("  Executable transient: %s\n", yesNo(isTransientExecutablePath(manager.exePath)))
+
 	if healthErr != nil {
-		fmt.Printf("daemon health_error=%v\n", healthErr)
+		fmt.Printf("  Health error: %v\n", healthErr)
+		if owner := SocketOwnerSummary(socketPath); strings.TrimSpace(owner) != "" {
+			fmt.Printf("  Socket owner: %s\n", owner)
+		}
+		lastError := LastErrorLine(manager.StderrLogPath())
+		if lastError != "" {
+			fmt.Printf("  Last daemon error: %s\n", lastError)
+		}
+		fmt.Println("")
+		fmt.Println("Next steps")
+		if !installed {
+			fmt.Println("  1. Install the service: ./bin/openusage telemetry daemon install")
+		} else {
+			fmt.Println("  1. Reinstall to refresh the unit and restart: ./bin/openusage telemetry daemon install")
+		}
+		fmt.Printf("  2. Check manager state: %s\n", manager.StatusHint())
+		if stderrPath := strings.TrimSpace(manager.StderrLogPath()); stderrPath != "" {
+			fmt.Printf("  3. Tail daemon logs: tail -n 80 %s\n", stderrPath)
+		}
+		if details {
+			fmt.Println("")
+			fmt.Println("Diagnostics")
+			fmt.Println(StartupDiagnostics(manager, socketPath))
+		} else {
+			fmt.Println("")
+			fmt.Println("Tip: rerun with --details for full diagnostics.")
+		}
 	} else {
-		fmt.Printf(
-			"daemon version=%s api=%s integration=%s\n",
-			strings.TrimSpace(health.DaemonVersion),
-			strings.TrimSpace(health.APIVersion),
-			strings.TrimSpace(health.IntegrationVersion),
-		)
+		fmt.Printf("  Daemon version: %s\n", strings.TrimSpace(health.DaemonVersion))
+		fmt.Printf("  API version: %s (compatible: %s)\n", strings.TrimSpace(health.APIVersion), yesNo(HealthAPICompatible(health)))
+		fmt.Printf("  Integration version: %s\n", strings.TrimSpace(health.IntegrationVersion))
+		fmt.Printf("  Provider registry: %s (compatible: %s)\n", strings.TrimSpace(health.ProviderRegistry), yesNo(HealthProviderRegistryCompatible(health)))
+		fmt.Printf("  Overall compatibility: %s\n", yesNo(HealthCurrent(health)))
+		if details {
+			fmt.Println("")
+			fmt.Println("Diagnostics")
+			fmt.Println(StartupDiagnostics(manager, socketPath))
+		}
 	}
 	return nil
+}
+
+func LastErrorLine(path string) string {
+	tail := TailFile(strings.TrimSpace(path), 120)
+	if strings.TrimSpace(tail) == "" {
+		return ""
+	}
+	lines := strings.Split(strings.ReplaceAll(tail, "\r\n", "\n"), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if strings.HasPrefix(line, "Error: ") {
+			return strings.TrimPrefix(line, "Error: ")
+		}
+	}
+	return ""
+}
+
+func yesNo(v bool) string {
+	if v {
+		return "yes"
+	}
+	return "no"
+}
+
+func valueOrNA(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "n/a"
+	}
+	return v
+}
+
+func SocketOwnerSummary(socketPath string) string {
+	socketPath = strings.TrimSpace(socketPath)
+	if socketPath == "" {
+		return ""
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		return ""
+	}
+	out, err := RunCommand("lsof", "-n", "-Fpcn", socketPath)
+	if err == nil {
+		if summary := parseLSOFFirstRecord(out); summary != "" {
+			return summary
+		}
+	}
+
+	out, err = RunCommand("lsof", "-n", socketPath)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(TailTextLines(out, 2))
+}
+
+func isTransientExecutablePath(path string) bool {
+	p := strings.TrimSpace(path)
+	if p == "" {
+		return true
+	}
+	normalized := filepath.ToSlash(strings.ToLower(filepath.Clean(p)))
+	if strings.Contains(normalized, "/go-build") && strings.Contains(normalized, "/exe/") {
+		return true
+	}
+	tmpRoot := filepath.ToSlash(strings.ToLower(filepath.Clean(os.TempDir())))
+	if tmpRoot == "" || tmpRoot == "." {
+		return false
+	}
+	return strings.HasPrefix(normalized, tmpRoot+"/go-build")
+}
+
+func parseLSOFFirstRecord(out string) string {
+	var (
+		pid  string
+		cmd  string
+		name string
+	)
+	for _, rawLine := range strings.Split(out, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		switch line[0] {
+		case 'p':
+			if pid == "" {
+				pid = strings.TrimSpace(line[1:])
+			}
+		case 'c':
+			if cmd == "" {
+				cmd = strings.TrimSpace(line[1:])
+			}
+		case 'n':
+			if name == "" {
+				name = strings.TrimSpace(line[1:])
+			}
+		}
+		if pid != "" && cmd != "" && name != "" {
+			break
+		}
+	}
+	var parts []string
+	if pid != "" {
+		parts = append(parts, "pid="+pid)
+	}
+	if cmd != "" {
+		parts = append(parts, "command="+cmd)
+	}
+	if name != "" {
+		parts = append(parts, "socket="+name)
+	}
+	return strings.TrimSpace(strings.Join(parts, " "))
 }
