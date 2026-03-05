@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,6 +106,7 @@ func (s *Store) Init(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_events_provider_window ON usage_events(provider_id, account_id, occurred_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_events_provider_account_type_occurred ON usage_events(provider_id, account_id, event_type, occurred_at DESC);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_events_type_provider ON usage_events(event_type, provider_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_usage_raw_events_source_system ON usage_raw_events(source_system);`,
 		`CREATE TABLE IF NOT EXISTS usage_reconciliation_windows (
 			recon_id TEXT PRIMARY KEY,
 			provider_id TEXT NOT NULL,
@@ -130,6 +132,69 @@ func (s *Store) Init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("telemetry: init schema: %w", err)
 		}
+	}
+	return nil
+}
+
+// RunMigrations runs one-shot data repair migrations. Called at daemon startup.
+func (s *Store) RunMigrations(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return fmt.Errorf("create migrations table: %w", err)
+	}
+
+	repairs := []struct {
+		name string
+		sql  string
+	}{
+		{
+			name: "repair_codex_provider_id",
+			sql: `UPDATE usage_events
+				SET provider_id = 'codex'
+				WHERE LOWER(TRIM(provider_id)) = 'openai'
+				  AND LOWER(TRIM(agent_name)) = 'codex'
+				  AND raw_event_id IN (
+					SELECT raw_event_id FROM usage_raw_events WHERE LOWER(TRIM(source_system)) = 'codex'
+				  )`,
+		},
+		{
+			name: "repair_codex_account_id",
+			sql: `UPDATE usage_events
+				SET account_id = 'codex-cli'
+				WHERE LOWER(TRIM(provider_id)) = 'codex'
+				  AND LOWER(TRIM(account_id)) = 'codex'
+				  AND LOWER(TRIM(agent_name)) = 'codex'
+				  AND raw_event_id IN (
+					SELECT raw_event_id FROM usage_raw_events WHERE LOWER(TRIM(source_system)) = 'codex'
+				  )`,
+		},
+		{
+			name: "repair_cursor_provider_id",
+			sql: `UPDATE usage_events
+				SET provider_id = 'cursor'
+				WHERE LOWER(TRIM(provider_id)) != 'cursor'
+				  AND raw_event_id IN (
+					SELECT raw_event_id FROM usage_raw_events WHERE LOWER(TRIM(source_system)) = 'cursor'
+				  )`,
+		},
+	}
+
+	for _, r := range repairs {
+		var exists int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM _migrations WHERE name = ?`, r.name).Scan(&exists); err != nil {
+			return fmt.Errorf("check migration %s: %w", r.name, err)
+		}
+		if exists > 0 {
+			continue
+		}
+		log.Printf("[migrations] running: %s", r.name)
+		start := time.Now()
+		if _, err := s.db.ExecContext(ctx, r.sql); err != nil {
+			return fmt.Errorf("run migration %s: %w", r.name, err)
+		}
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO _migrations (name, applied_at) VALUES (?, datetime('now'))`, r.name); err != nil {
+			return fmt.Errorf("record migration %s: %w", r.name, err)
+		}
+		log.Printf("[migrations] completed: %s (%dms)", r.name, time.Since(start).Milliseconds())
 	}
 	return nil
 }
@@ -394,7 +459,7 @@ func enrichEventByDedupKey(ctx context.Context, tx *sql.Tx, dedupKey string, nor
 	modelRaw := chooseString(current.ModelRaw, norm.ModelRaw, override)
 	modelCanonical := chooseString(current.ModelCanonical, norm.ModelCanonical, override)
 	modelLineage := chooseString(current.ModelLineageID, norm.ModelLineageID, override)
-	toolName := chooseString(current.ToolName, norm.ToolName, override)
+	toolName := chooseToolName(current.ToolName, norm.ToolName, override)
 
 	inputTokens := chooseInt64(current.InputTokens, norm.InputTokens, override)
 	outputTokens := chooseInt64(current.OutputTokens, norm.OutputTokens, override)
@@ -480,6 +545,43 @@ func chooseString(current sql.NullString, incoming string, override bool) string
 		return trimmedIncoming
 	}
 	return strings.TrimSpace(current.String)
+}
+
+func chooseToolName(current sql.NullString, incoming string, override bool) string {
+	currentName := strings.ToLower(strings.TrimSpace(current.String))
+	incomingName := strings.ToLower(strings.TrimSpace(incoming))
+
+	if !current.Valid || currentName == "" {
+		return incomingName
+	}
+	if override && incomingName != "" {
+		return incomingName
+	}
+	if incomingName == "" {
+		return currentName
+	}
+	if currentName == "unknown" && incomingName != "unknown" {
+		return incomingName
+	}
+	// When parsers improve MCP normalization over time, prefer canonical
+	// mcp__server__function labels so existing deduped rows self-heal.
+	if isCanonicalMCPToolName(incomingName) && !isCanonicalMCPToolName(currentName) {
+		return incomingName
+	}
+	return currentName
+}
+
+func isCanonicalMCPToolName(name string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(name))
+	if !strings.HasPrefix(normalized, "mcp__") {
+		return false
+	}
+	rest := strings.TrimPrefix(normalized, "mcp__")
+	parts := strings.SplitN(rest, "__", 2)
+	if len(parts) != 2 {
+		return false
+	}
+	return strings.TrimSpace(parts[0]) != "" && strings.TrimSpace(parts[1]) != ""
 }
 
 func chooseInt64(current sql.NullInt64, incoming *int64, override bool) *int64 {
@@ -599,6 +701,36 @@ func (s *Store) PruneOrphanRawEvents(ctx context.Context, limit int) (int64, err
 	n, err := res.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("telemetry: prune orphan raw events rows affected: %w", err)
+	}
+	return n, nil
+}
+
+// PruneRawEventPayloads clears source_payload from old raw events to reclaim
+// disk space. All useful data has already been extracted into usage_events.
+// Keeps payloads for events newer than retentionHours.
+func (s *Store) PruneRawEventPayloads(ctx context.Context, retentionHours int, limit int) (int64, error) {
+	if s == nil || s.db == nil || retentionHours < 0 || limit <= 0 {
+		return 0, nil
+	}
+	cutoff := fmt.Sprintf("-%d hours", retentionHours)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE usage_raw_events
+		SET source_payload = '{}'
+		WHERE raw_event_id IN (
+			SELECT raw_event_id
+			FROM usage_raw_events
+			WHERE ingested_at < datetime('now', ?)
+			  AND LENGTH(source_payload) > 2
+			ORDER BY ingested_at ASC
+			LIMIT ?
+		)
+	`, cutoff, limit)
+	if err != nil {
+		return 0, fmt.Errorf("telemetry: prune raw event payloads: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("telemetry: prune raw event payloads rows affected: %w", err)
 	}
 	return n, nil
 }

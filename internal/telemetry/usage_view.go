@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/janekbaraniewski/openusage/internal/core"
@@ -39,9 +40,15 @@ type telemetrySourceAgg struct {
 }
 
 type telemetryToolAgg struct {
-	Tool    string
-	Calls   float64
-	Calls1d float64
+	Tool           string
+	Calls          float64
+	Calls1d        float64
+	CallsOK        float64
+	CallsOK1d      float64
+	CallsError     float64
+	CallsError1d   float64
+	CallsAborted   float64
+	CallsAborted1d float64
 }
 
 type telemetryMCPFunctionAgg struct {
@@ -118,7 +125,28 @@ type telemetryUsageAgg struct {
 type usageFilter struct {
 	ProviderIDs     []string
 	AccountID       string
-	TimeWindowHours int // 0 = no filter
+	TimeWindowHours int    // 0 = no filter
+	materializedTbl string // if set, queries read from this temp table instead of rebuilding the CTE
+}
+
+func clientDimensionExpr() string {
+	return `COALESCE(
+		NULLIF(TRIM(
+			COALESCE(
+				json_extract(source_payload, '$.client'),
+				json_extract(source_payload, '$.payload.client'),
+				json_extract(source_payload, '$._normalized.client'),
+				json_extract(source_payload, '$.cursor_source'),
+				json_extract(source_payload, '$.source.client'),
+				''
+			)
+		), ''),
+		CASE
+			WHEN LOWER(TRIM(source_system)) = 'codex' THEN 'CLI'
+			ELSE NULL
+		END,
+		COALESCE(NULLIF(TRIM(source_system), ''), NULLIF(TRIM(workspace_id), ''), 'unknown')
+	)`
 }
 
 func applyCanonicalUsageViewWithDB(
@@ -135,7 +163,10 @@ func applyCanonicalUsageViewWithDB(
 
 	out := make(map[string]core.UsageSnapshot, len(snaps))
 	cache := make(map[string]*telemetryUsageAgg)
+
+	activeStart := time.Now()
 	telemetryActiveProviders := queryTelemetryActiveProviders(ctx, db)
+	core.Tracef("[usage_view_perf] queryTelemetryActiveProviders: %dms", time.Since(activeStart).Milliseconds())
 
 	for accountID, snap := range snaps {
 		s := snap
@@ -208,6 +239,16 @@ func applyUsageViewToSnapshot(snap *core.UsageSnapshot, agg *telemetryUsageAgg, 
 	if snap.DailySeries == nil {
 		snap.DailySeries = make(map[string][]core.TimePoint)
 	}
+
+	// Save API-sourced model cost metrics (billing-cycle) before cleanup.
+	// These will be restored if telemetry events lack sufficient cost attribution.
+	savedAPIModelCosts := make(map[string]core.Metric)
+	for key, m := range snap.Metrics {
+		if strings.HasPrefix(key, "model_") && strings.HasSuffix(key, "_cost") && m.Window == "billing-cycle" {
+			savedAPIModelCosts[key] = m
+		}
+	}
+
 	metricsBefore := len(snap.Metrics)
 	_, hadFiveHourBefore := snap.Metrics["usage_five_hour"]
 	stripAllTime := timeWindow != "" && timeWindow != "all"
@@ -219,6 +260,7 @@ func applyUsageViewToSnapshot(snap *core.UsageSnapshot, agg *telemetryUsageAgg, 
 			strings.HasPrefix(key, "model_") ||
 			strings.HasPrefix(key, "provider_") ||
 			strings.HasPrefix(key, "lang_") ||
+			strings.HasPrefix(key, "interface_") ||
 			isStaleActivityMetric(key) {
 			delete(snap.Metrics, key)
 			deletedCount++
@@ -308,11 +350,22 @@ func applyUsageViewToSnapshot(snap *core.UsageSnapshot, agg *telemetryUsageAgg, 
 			Requests:        float64Ptr(model.Requests),
 		})
 	}
-	// Only compute unattributed model cost when we have windowed model data.
-	// When agg.Models is empty (no events in window), the authoritativeCost
-	// represents the full billing cycle — attributing it as "unattributed"
-	// would be misleading for the selected time range.
-	if len(agg.Models) > 0 {
+	// When telemetry events lack cost attribution but the provider's API
+	// supplied per-model cost data (e.g. Cursor's GetAggregatedUsageEvents),
+	// restore the API model costs so the Model Burn section shows the real
+	// per-model breakdown instead of a single "unattributed" entry.
+	telemetryCostInsufficient := authoritativeCost > 0 && modelCostTotal < authoritativeCost*0.1
+	if telemetryCostInsufficient && len(savedAPIModelCosts) > 0 {
+		for key, m := range savedAPIModelCosts {
+			snap.Metrics[key] = m
+		}
+		core.Tracef("[usage_view] %s: restored %d API model cost metrics (telemetry cost %.2f << authoritative %.2f)",
+			snap.ProviderID, len(savedAPIModelCosts), modelCostTotal, authoritativeCost)
+	} else if len(agg.Models) > 0 {
+		// Only compute unattributed model cost when telemetry has meaningful
+		// cost data. When agg.Models is empty (no events in window), the
+		// authoritativeCost represents the full billing cycle — attributing
+		// it as "unattributed" would be misleading for the selected time range.
 		if delta := authoritativeCost - modelCostTotal; authoritativeCost > 0 && delta > 0.000001 {
 			uk := "model_unattributed"
 			snap.Metrics[uk+"_cost_usd"] = core.Metric{Used: float64Ptr(delta), Unit: "USD", Window: timeWindow}
@@ -320,19 +373,21 @@ func applyUsageViewToSnapshot(snap *core.UsageSnapshot, agg *telemetryUsageAgg, 
 		}
 	}
 
-	providerCostTotal := 0.0
-	for _, provider := range agg.Providers {
-		pk := sanitizeMetricID(provider.Provider)
-		snap.Metrics["provider_"+pk+"_cost_usd"] = core.Metric{Used: float64Ptr(provider.CostUSD), Unit: "USD", Window: timeWindow}
-		snap.Metrics["provider_"+pk+"_input_tokens"] = core.Metric{Used: float64Ptr(provider.Input), Unit: "tokens", Window: timeWindow}
-		snap.Metrics["provider_"+pk+"_output_tokens"] = core.Metric{Used: float64Ptr(provider.Output), Unit: "tokens", Window: timeWindow}
-		snap.Metrics["provider_"+pk+"_requests"] = core.Metric{Used: float64Ptr(provider.Requests), Unit: "requests", Window: timeWindow}
-		providerCostTotal += provider.CostUSD
-	}
-	if delta := authoritativeCost - providerCostTotal; authoritativeCost > 0 && delta > 0.000001 {
-		uk := "provider_unattributed"
-		snap.Metrics[uk+"_cost_usd"] = core.Metric{Used: float64Ptr(delta), Unit: "USD", Window: timeWindow}
-		snap.SetDiagnostic("telemetry_unattributed_provider_cost_usd", fmt.Sprintf("%.6f", delta))
+	if !strings.EqualFold(strings.TrimSpace(snap.ProviderID), "codex") {
+		providerCostTotal := 0.0
+		for _, provider := range agg.Providers {
+			pk := sanitizeMetricID(provider.Provider)
+			snap.Metrics["provider_"+pk+"_cost_usd"] = core.Metric{Used: float64Ptr(provider.CostUSD), Unit: "USD", Window: timeWindow}
+			snap.Metrics["provider_"+pk+"_input_tokens"] = core.Metric{Used: float64Ptr(provider.Input), Unit: "tokens", Window: timeWindow}
+			snap.Metrics["provider_"+pk+"_output_tokens"] = core.Metric{Used: float64Ptr(provider.Output), Unit: "tokens", Window: timeWindow}
+			snap.Metrics["provider_"+pk+"_requests"] = core.Metric{Used: float64Ptr(provider.Requests), Unit: "requests", Window: timeWindow}
+			providerCostTotal += provider.CostUSD
+		}
+		if delta := authoritativeCost - providerCostTotal; authoritativeCost > 0 && delta > 0.000001 {
+			uk := "provider_unattributed"
+			snap.Metrics[uk+"_cost_usd"] = core.Metric{Used: float64Ptr(delta), Unit: "USD", Window: timeWindow}
+			snap.SetDiagnostic("telemetry_unattributed_provider_cost_usd", fmt.Sprintf("%.6f", delta))
+		}
 	}
 
 	for _, source := range agg.Sources {
@@ -352,10 +407,29 @@ func applyUsageViewToSnapshot(snap *core.UsageSnapshot, agg *telemetryUsageAgg, 
 		snap.Metrics["client_"+sk+"_sessions"] = core.Metric{Used: float64Ptr(source.Sessions), Unit: "sessions", Window: timeWindow}
 	}
 
+	var totalToolCalls float64
+	var totalToolCallsOK float64
+	var totalToolCallsError float64
+	var totalToolCallsAborted float64
 	for _, tool := range agg.Tools {
 		tk := sanitizeMetricID(tool.Tool)
 		snap.Metrics["tool_"+tk] = core.Metric{Used: float64Ptr(tool.Calls), Unit: "calls", Window: timeWindow}
 		snap.Metrics["tool_"+tk+"_today"] = core.Metric{Used: float64Ptr(tool.Calls1d), Unit: "calls", Window: "1d"}
+		totalToolCalls += tool.Calls
+		totalToolCallsOK += tool.CallsOK
+		totalToolCallsError += tool.CallsError
+		totalToolCallsAborted += tool.CallsAborted
+	}
+	if totalToolCalls > 0 {
+		snap.Metrics["tool_calls_total"] = core.Metric{Used: float64Ptr(totalToolCalls), Unit: "calls", Window: timeWindow}
+		snap.Metrics["tool_completed"] = core.Metric{Used: float64Ptr(totalToolCallsOK), Unit: "calls", Window: timeWindow}
+		snap.Metrics["tool_errored"] = core.Metric{Used: float64Ptr(totalToolCallsError), Unit: "calls", Window: timeWindow}
+		snap.Metrics["tool_cancelled"] = core.Metric{Used: float64Ptr(totalToolCallsAborted), Unit: "calls", Window: timeWindow}
+		successRate := 0.0
+		if totalToolCalls > 0 {
+			successRate = (totalToolCallsOK / totalToolCalls) * 100
+		}
+		snap.Metrics["tool_success_rate"] = core.Metric{Used: float64Ptr(successRate), Unit: "%", Window: timeWindow}
 	}
 
 	// MCP server metrics.
@@ -408,6 +482,12 @@ func applyUsageViewToSnapshot(snap *core.UsageSnapshot, agg *telemetryUsageAgg, 
 	cs := agg.CodeStats
 	if cs.FilesChanged > 0 {
 		snap.Metrics["composer_files_changed"] = core.Metric{Used: float64Ptr(cs.FilesChanged), Unit: "files", Window: timeWindow}
+	}
+	if cs.LinesAdded > 0 {
+		snap.Metrics["composer_lines_added"] = core.Metric{Used: float64Ptr(cs.LinesAdded), Unit: "lines", Window: timeWindow}
+	}
+	if cs.LinesRemoved > 0 {
+		snap.Metrics["composer_lines_removed"] = core.Metric{Used: float64Ptr(cs.LinesRemoved), Unit: "lines", Window: timeWindow}
 	}
 
 	// Emit window-level aggregate metrics for the TUI header/tile display.
@@ -530,6 +610,7 @@ func loadUsageViewForProviderWithSources(ctx context.Context, db *sql.DB, provid
 }
 
 func loadUsageViewForFilter(ctx context.Context, db *sql.DB, filter usageFilter) (*telemetryUsageAgg, error) {
+	filterStart := time.Now()
 	agg := &telemetryUsageAgg{
 		ModelDaily:   make(map[string][]core.TimePoint),
 		SourceDaily:  make(map[string][]core.TimePoint),
@@ -537,65 +618,121 @@ func loadUsageViewForFilter(ctx context.Context, db *sql.DB, filter usageFilter)
 		ClientTokens: make(map[string][]core.TimePoint),
 	}
 
+	// Materialize the deduped CTE into a temp table so subsequent queries
+	// read from a flat table instead of rebuilding the 3-level CTE each time.
 	usageCTE, whereArgs := dedupedUsageCTE(filter)
-	countQuery := usageCTE + `
+	tempTable := "_deduped_tmp"
+
+	matStart := time.Now()
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tempTable))
+	materializeSQL := fmt.Sprintf("CREATE TEMP TABLE %s AS %s SELECT * FROM deduped_usage", tempTable, usageCTE)
+	if _, err := db.ExecContext(ctx, materializeSQL, whereArgs...); err != nil {
+		return nil, fmt.Errorf("materialize deduped usage: %w", err)
+	}
+	core.Tracef("[usage_view_perf] materialize temp table: %dms (providers=%v, windowHours=%d)",
+		time.Since(matStart).Milliseconds(), filter.ProviderIDs, filter.TimeWindowHours)
+	defer func() {
+		_, _ = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tempTable))
+	}()
+
+	// Create indexes on the temp table for the aggregation queries.
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_deduped_event_type ON %s(event_type)", tempTable))
+	_, _ = db.ExecContext(ctx, fmt.Sprintf("CREATE INDEX IF NOT EXISTS idx_deduped_occurred ON %s(occurred_at)", tempTable))
+
+	// Count from the materialized table.
+	countStart := time.Now()
+	countQuery := fmt.Sprintf(`
 		SELECT COALESCE(MAX(occurred_at), ''), COUNT(*)
-		FROM deduped_usage
-		WHERE 1=1
-		  AND event_type IN ('message_usage', 'tool_usage')
-	`
-	if err := db.QueryRowContext(ctx, countQuery, whereArgs...).Scan(&agg.LastOccurred, &agg.EventCount); err != nil {
+		FROM %s
+		WHERE event_type IN ('message_usage', 'tool_usage')
+	`, tempTable)
+	if err := db.QueryRowContext(ctx, countQuery).Scan(&agg.LastOccurred, &agg.EventCount); err != nil {
 		return nil, fmt.Errorf("canonical usage count query: %w", err)
 	}
+	core.Tracef("[usage_view_perf] countQuery: %dms (events=%d, providers=%v, windowHours=%d)",
+		time.Since(countStart).Milliseconds(), agg.EventCount, filter.ProviderIDs, filter.TimeWindowHours)
 	if agg.EventCount == 0 {
 		return agg, nil
 	}
 
-	models, err := queryModelAgg(ctx, db, filter)
+	// All subsequent queries use the materialized temp table.
+	matFilter := filter
+	matFilter.materializedTbl = tempTable
+
+	trace := func(label string) func() {
+		start := time.Now()
+		return func() { core.Tracef("[usage_view_perf]   %s: %dms", label, time.Since(start).Milliseconds()) }
+	}
+
+	done := trace("queryModelAgg")
+	models, err := queryModelAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	sources, err := querySourceAgg(ctx, db, filter)
+	done = trace("querySourceAgg")
+	sources, err := querySourceAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	tools, err := queryToolAgg(ctx, db, filter)
+	done = trace("queryToolAgg")
+	tools, err := queryToolAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	providers, err := queryProviderAgg(ctx, db, filter)
+	done = trace("queryProviderAgg")
+	providers, err := queryProviderAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	languages, err := queryLanguageAgg(ctx, db, filter)
+	done = trace("queryLanguageAgg")
+	languages, err := queryLanguageAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	activity, err := queryActivityAgg(ctx, db, filter)
+	done = trace("queryActivityAgg")
+	activity, err := queryActivityAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	codeStats, err := queryCodeStatsAgg(ctx, db, filter)
+	done = trace("queryCodeStatsAgg")
+	codeStats, err := queryCodeStatsAgg(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	daily, err := queryDailyTotals(ctx, db, filter)
+	done = trace("queryDailyTotals")
+	daily, err := queryDailyTotals(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
-	modelDaily, err := queryDailyByDimension(ctx, db, filter, "model")
+	done = trace("queryDailyByDimension(model)")
+	modelDaily, err := queryDailyByDimension(ctx, db, matFilter, "model")
+	done()
 	if err != nil {
 		return nil, err
 	}
-	sourceDaily, err := queryDailyByDimension(ctx, db, filter, "source")
+	done = trace("queryDailyByDimension(source)")
+	sourceDaily, err := queryDailyByDimension(ctx, db, matFilter, "source")
+	done()
 	if err != nil {
 		return nil, err
 	}
-	clientDaily, err := queryDailyByDimension(ctx, db, filter, "client")
+	done = trace("queryDailyByDimension(client)")
+	clientDaily, err := queryDailyByDimension(ctx, db, matFilter, "client")
+	done()
 	if err != nil {
 		return nil, err
 	}
-	clientTokens, err := queryDailyClientTokens(ctx, db, filter)
+	done = trace("queryDailyClientTokens")
+	clientTokens, err := queryDailyClientTokens(ctx, db, matFilter)
+	done()
 	if err != nil {
 		return nil, err
 	}
@@ -613,6 +750,7 @@ func loadUsageViewForFilter(ctx context.Context, db *sql.DB, filter usageFilter)
 	agg.SourceDaily = sourceDaily
 	agg.ClientDaily = clientDaily
 	agg.ClientTokens = clientTokens
+	core.Tracef("[usage_view_perf] loadUsageViewForFilter TOTAL: %dms (providers=%v)", time.Since(filterStart).Milliseconds(), filter.ProviderIDs)
 	return agg, nil
 }
 
@@ -672,7 +810,7 @@ func querySourceAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]tele
 	usageCTE, whereArgs := dedupedUsageCTE(filter)
 	query := usageCTE + `
 		SELECT
-			COALESCE(NULLIF(TRIM(workspace_id), ''), COALESCE(NULLIF(TRIM(source_system), ''), 'unknown')) AS source_name,
+			` + clientDimensionExpr() + ` AS source_name,
 			SUM(COALESCE(requests, 1)) AS requests,
 			SUM(CASE WHEN date(occurred_at) = date('now') THEN COALESCE(requests, 1) ELSE 0 END) AS requests_today,
 			SUM(COALESCE(total_tokens,
@@ -726,11 +864,16 @@ func queryToolAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]teleme
 		SELECT
 			COALESCE(NULLIF(TRIM(LOWER(tool_name)), ''), 'unknown') AS tool_name,
 			SUM(COALESCE(requests, 1)) AS calls,
-			SUM(CASE WHEN date(occurred_at) = date('now') THEN COALESCE(requests, 1) ELSE 0 END) AS calls_today
+			SUM(CASE WHEN date(occurred_at) = date('now') THEN COALESCE(requests, 1) ELSE 0 END) AS calls_today,
+			SUM(CASE WHEN status = 'ok' THEN COALESCE(requests, 1) ELSE 0 END) AS calls_ok,
+			SUM(CASE WHEN date(occurred_at) = date('now') AND status = 'ok' THEN COALESCE(requests, 1) ELSE 0 END) AS calls_ok_today,
+			SUM(CASE WHEN status = 'error' THEN COALESCE(requests, 1) ELSE 0 END) AS calls_error,
+			SUM(CASE WHEN date(occurred_at) = date('now') AND status = 'error' THEN COALESCE(requests, 1) ELSE 0 END) AS calls_error_today,
+			SUM(CASE WHEN status = 'aborted' THEN COALESCE(requests, 1) ELSE 0 END) AS calls_aborted,
+			SUM(CASE WHEN date(occurred_at) = date('now') AND status = 'aborted' THEN COALESCE(requests, 1) ELSE 0 END) AS calls_aborted_today
 		FROM deduped_usage
 		WHERE 1=1
 		  AND event_type = 'tool_usage'
-		  AND status != 'error'
 		GROUP BY tool_name
 		ORDER BY calls DESC
 	`
@@ -743,7 +886,17 @@ func queryToolAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]teleme
 	var out []telemetryToolAgg
 	for rows.Next() {
 		var row telemetryToolAgg
-		if err := rows.Scan(&row.Tool, &row.Calls, &row.Calls1d); err != nil {
+		if err := rows.Scan(
+			&row.Tool,
+			&row.Calls,
+			&row.Calls1d,
+			&row.CallsOK,
+			&row.CallsOK1d,
+			&row.CallsError,
+			&row.CallsError1d,
+			&row.CallsAborted,
+			&row.CallsAborted1d,
+		); err != nil {
 			continue
 		}
 		out = append(out, row)
@@ -753,7 +906,7 @@ func queryToolAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]teleme
 
 func queryLanguageAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]telemetryLanguageAgg, error) {
 	usageCTE, whereArgs := dedupedUsageCTE(filter)
-	// Query file paths from tool_usage events. Language is inferred in Go
+	// Query file paths from usage events. Language is inferred in Go
 	// from the file extension since SQLite lacks convenient path functions.
 	//
 	// File paths live in different locations depending on the source:
@@ -761,6 +914,7 @@ func queryLanguageAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]te
 	//   - Hook events:      $.tool_input.file_path (Read/Edit/Write)
 	//                       $.tool_input.path (Grep/Glob)
 	//   - Hook response:    $.tool_response.file.filePath (Read response)
+	//   - Cursor tracking:  $.file or $.file_extension (message_usage events)
 	query := usageCTE + `
 		SELECT
 			COALESCE(
@@ -769,11 +923,12 @@ func queryLanguageAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]te
 				NULLIF(TRIM(json_extract(source_payload, '$.tool_input.file_path')), ''),
 				NULLIF(TRIM(json_extract(source_payload, '$.tool_input.path')), ''),
 				NULLIF(TRIM(json_extract(source_payload, '$.tool_response.file.filePath')), ''),
+				NULLIF(TRIM(json_extract(source_payload, '$.file_extension')), ''),
 				''
 			) AS file_path,
 			COALESCE(requests, 1) AS requests
 		FROM deduped_usage
-		WHERE event_type = 'tool_usage'
+		WHERE event_type IN ('tool_usage', 'message_usage')
 		  AND status != 'error'
 	`
 	rows, err := db.QueryContext(ctx, query, whereArgs...)
@@ -805,7 +960,8 @@ func queryLanguageAgg(ctx context.Context, db *sql.DB, filter usageFilter) ([]te
 	return out, nil
 }
 
-// inferLanguageFromFilePath maps a file path to a programming language name.
+// inferLanguageFromFilePath maps a file path, file extension, or bare
+// extension string to a programming language name.
 func inferLanguageFromFilePath(path string) string {
 	p := strings.TrimSpace(path)
 	if p == "" {
@@ -828,9 +984,18 @@ func inferLanguageFromFilePath(path string) string {
 	// Check file extension.
 	idx := strings.LastIndex(p, ".")
 	if idx < 0 {
+		// Handle bare extension without dot (e.g., "go", "py" from file_extension fields).
+		if lang := extToLanguage("." + strings.ToLower(p)); lang != "" {
+			return lang
+		}
 		return ""
 	}
 	ext := strings.ToLower(p[idx:])
+	return extToLanguage(ext)
+}
+
+// extToLanguage maps a dotted file extension to a language name.
+func extToLanguage(ext string) string {
 	switch ext {
 	case ".go":
 		return "go"
@@ -866,6 +1031,10 @@ func inferLanguageFromFilePath(path string) string {
 		return "php"
 	case ".swift":
 		return "swift"
+	case ".kt", ".kts":
+		return "kotlin"
+	case ".cs":
+		return "csharp"
 	case ".vue":
 		return "vue"
 	case ".svelte":
@@ -874,6 +1043,24 @@ func inferLanguageFromFilePath(path string) string {
 		return "toml"
 	case ".xml":
 		return "xml"
+	case ".css", ".scss", ".less":
+		return "css"
+	case ".html", ".htm":
+		return "html"
+	case ".dart":
+		return "dart"
+	case ".zig":
+		return "zig"
+	case ".lua":
+		return "lua"
+	case ".r":
+		return "r"
+	case ".proto":
+		return "protobuf"
+	case ".ex", ".exs":
+		return "elixir"
+	case ".graphql", ".gql":
+		return "graphql"
 	}
 	return ""
 }
@@ -932,21 +1119,21 @@ func queryActivityAgg(ctx context.Context, db *sql.DB, filter usageFilter) (tele
 	usageCTE, whereArgs := dedupedUsageCTE(filter)
 	query := usageCTE + `
 		SELECT
-			COUNT(DISTINCT CASE WHEN event_type = 'message_usage' THEN
+			COUNT(DISTINCT CASE WHEN event_type = 'message_usage' AND status != 'error' THEN
 				COALESCE(NULLIF(TRIM(message_id), ''), COALESCE(NULLIF(TRIM(turn_id), ''), dedup_key))
 			END) AS messages,
-			COUNT(DISTINCT CASE WHEN event_type = 'message_usage' THEN
+			COUNT(DISTINCT CASE WHEN event_type = 'message_usage' AND status != 'error' THEN
 				NULLIF(TRIM(session_id), '')
 			END) AS sessions,
 			SUM(CASE WHEN event_type = 'tool_usage' THEN COALESCE(requests, 1) ELSE 0 END) AS tool_calls,
-			SUM(CASE WHEN event_type = 'message_usage' THEN COALESCE(input_tokens, 0) ELSE 0 END) AS input_tokens,
-			SUM(CASE WHEN event_type = 'message_usage' THEN COALESCE(output_tokens, 0) ELSE 0 END) AS output_tokens,
-			SUM(CASE WHEN event_type = 'message_usage' THEN COALESCE(cache_read_tokens, 0) ELSE 0 END) AS cached_tokens,
-			SUM(CASE WHEN event_type = 'message_usage' THEN COALESCE(reasoning_tokens, 0) ELSE 0 END) AS reasoning_tokens,
-			SUM(CASE WHEN event_type = 'message_usage' THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
-			SUM(CASE WHEN event_type = 'message_usage' THEN COALESCE(cost_usd, 0) ELSE 0 END) AS total_cost
+			SUM(CASE WHEN event_type = 'message_usage' AND status != 'error' THEN COALESCE(input_tokens, 0) ELSE 0 END) AS input_tokens,
+			SUM(CASE WHEN event_type = 'message_usage' AND status != 'error' THEN COALESCE(output_tokens, 0) ELSE 0 END) AS output_tokens,
+			SUM(CASE WHEN event_type = 'message_usage' AND status != 'error' THEN COALESCE(cache_read_tokens, 0) ELSE 0 END) AS cached_tokens,
+			SUM(CASE WHEN event_type = 'message_usage' AND status != 'error' THEN COALESCE(reasoning_tokens, 0) ELSE 0 END) AS reasoning_tokens,
+			SUM(CASE WHEN event_type = 'message_usage' AND status != 'error' THEN COALESCE(total_tokens, 0) ELSE 0 END) AS total_tokens,
+			SUM(CASE WHEN event_type = 'message_usage' AND status != 'error' THEN COALESCE(cost_usd, 0) ELSE 0 END) AS total_cost
 		FROM deduped_usage
-		WHERE status != 'error'
+		WHERE 1=1
 	`
 	var out telemetryActivityAgg
 	err := db.QueryRowContext(ctx, query, whereArgs...).Scan(
@@ -964,15 +1151,18 @@ func queryCodeStatsAgg(ctx context.Context, db *sql.DB, filter usageFilter) (tel
 	usageCTE, whereArgs := dedupedUsageCTE(filter)
 	// Count distinct file paths from tool_usage events to estimate files changed.
 	// Only count mutating tools (edit, write, create, delete, rename, move).
+	// Also sum lines_added/lines_removed from message_usage event payloads
+	// (e.g. Cursor composer sessions store these).
 	query := usageCTE + `
 		SELECT
 			COUNT(DISTINCT CASE
-				WHEN LOWER(tool_name) LIKE '%edit%'
+				WHEN event_type = 'tool_usage'
+				  AND (LOWER(tool_name) LIKE '%edit%'
 				  OR LOWER(tool_name) LIKE '%write%'
 				  OR LOWER(tool_name) LIKE '%create%'
 				  OR LOWER(tool_name) LIKE '%delete%'
 				  OR LOWER(tool_name) LIKE '%rename%'
-				  OR LOWER(tool_name) LIKE '%move%'
+				  OR LOWER(tool_name) LIKE '%move%')
 				THEN NULLIF(TRIM(COALESCE(
 					json_extract(source_payload, '$.file'),
 					json_extract(source_payload, '$.payload.file'),
@@ -980,13 +1170,15 @@ func queryCodeStatsAgg(ctx context.Context, db *sql.DB, filter usageFilter) (tel
 					json_extract(source_payload, '$.tool_input.path'),
 					''
 				)), '')
-			END) AS files_changed
+			END) AS files_changed,
+			SUM(COALESCE(CAST(json_extract(source_payload, '$.lines_added') AS REAL), 0)) AS lines_added,
+			SUM(COALESCE(CAST(json_extract(source_payload, '$.lines_removed') AS REAL), 0)) AS lines_removed
 		FROM deduped_usage
-		WHERE event_type = 'tool_usage'
+		WHERE event_type IN ('tool_usage', 'message_usage')
 		  AND status != 'error'
 	`
 	var out telemetryCodeStatsAgg
-	err := db.QueryRowContext(ctx, query, whereArgs...).Scan(&out.FilesChanged)
+	err := db.QueryRowContext(ctx, query, whereArgs...).Scan(&out.FilesChanged, &out.LinesAdded, &out.LinesRemoved)
 	if err != nil {
 		return out, fmt.Errorf("canonical usage code stats query: %w", err)
 	}
@@ -1054,7 +1246,7 @@ func queryDailyByDimension(ctx context.Context, db *sql.DB, filter usageFilter, 
 			  AND status != 'error'%s
 			GROUP BY day, dim_key
 		`, dailyTimeFilter)
-	case "source", "client":
+	case "source":
 		query = usageCTE + fmt.Sprintf(`
 			SELECT date(occurred_at) AS day,
 			       COALESCE(NULLIF(TRIM(workspace_id), ''), COALESCE(NULLIF(TRIM(source_system), ''), 'unknown')) AS dim_key,
@@ -1065,6 +1257,17 @@ func queryDailyByDimension(ctx context.Context, db *sql.DB, filter usageFilter, 
 			  AND status != 'error'%s
 			GROUP BY day, dim_key
 		`, dailyTimeFilter)
+	case "client":
+		query = usageCTE + fmt.Sprintf(`
+			SELECT date(occurred_at) AS day,
+			       %s AS dim_key,
+			       SUM(COALESCE(requests, 1)) AS value
+			FROM deduped_usage
+			WHERE 1=1
+			  AND event_type = 'message_usage'
+			  AND status != 'error'%s
+			GROUP BY day, dim_key
+		`, clientDimensionExpr(), dailyTimeFilter)
 	default:
 		return map[string][]core.TimePoint{}, nil
 	}
@@ -1108,7 +1311,7 @@ func queryDailyClientTokens(ctx context.Context, db *sql.DB, filter usageFilter)
 	query := usageCTE + fmt.Sprintf(`
 		SELECT
 			date(occurred_at) AS day,
-			COALESCE(NULLIF(TRIM(workspace_id), ''), COALESCE(NULLIF(TRIM(source_system), ''), 'unknown')) AS source_name,
+			%s AS source_name,
 			SUM(COALESCE(total_tokens,
 				COALESCE(input_tokens, 0) +
 				COALESCE(output_tokens, 0) +
@@ -1120,7 +1323,7 @@ func queryDailyClientTokens(ctx context.Context, db *sql.DB, filter usageFilter)
 		  AND event_type = 'message_usage'
 		  AND status != 'error'%s
 		GROUP BY day, source_name
-	`, dailyTimeFilter)
+	`, clientDimensionExpr(), dailyTimeFilter)
 	rows, err := db.QueryContext(ctx, query, whereArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("canonical usage daily client token query: %w", err)
@@ -1152,6 +1355,10 @@ func queryDailyClientTokens(ctx context.Context, db *sql.DB, filter usageFilter)
 }
 
 func dedupedUsageCTE(filter usageFilter) (string, []any) {
+	// If a materialized temp table exists, just alias it — no CTE rebuild needed.
+	if filter.materializedTbl != "" {
+		return fmt.Sprintf(`WITH deduped_usage AS (SELECT * FROM %s) `, filter.materializedTbl), nil
+	}
 	where, args := usageWhereClause("e", filter)
 	cte := fmt.Sprintf(`
 		WITH scoped_usage AS (
@@ -1168,12 +1375,16 @@ func dedupedUsageCTE(filter usageFilter) (string, []any) {
 		ranked_usage AS (
 			SELECT
 				scoped_usage.*,
-				CASE
-					WHEN COALESCE(NULLIF(TRIM(tool_call_id), ''), '') != '' THEN 'tool:' || LOWER(TRIM(tool_call_id))
-					WHEN COALESCE(NULLIF(TRIM(message_id), ''), '') != '' THEN 'message:' || LOWER(TRIM(message_id))
-					WHEN COALESCE(NULLIF(TRIM(turn_id), ''), '') != '' THEN 'turn:' || LOWER(TRIM(turn_id))
-					ELSE 'fallback:' || dedup_key
-				END AS logical_event_id,
+					CASE
+						WHEN COALESCE(NULLIF(TRIM(tool_call_id), ''), '') != '' THEN 'tool:' || LOWER(TRIM(tool_call_id))
+						WHEN LOWER(TRIM(event_type)) = 'message_usage'
+							AND LOWER(TRIM(source_system)) = 'codex'
+							AND COALESCE(NULLIF(TRIM(turn_id), ''), '') != ''
+						THEN 'message_turn:' || LOWER(TRIM(turn_id))
+						WHEN COALESCE(NULLIF(TRIM(message_id), ''), '') != '' THEN 'message:' || LOWER(TRIM(message_id))
+						WHEN COALESCE(NULLIF(TRIM(turn_id), ''), '') != '' THEN 'turn:' || LOWER(TRIM(turn_id))
+						ELSE 'fallback:' || dedup_key
+					END AS logical_event_id,
 				CASE COALESCE(NULLIF(TRIM(source_channel), ''), '')
 					WHEN 'hook' THEN 4
 					WHEN 'sse' THEN 3
@@ -1284,7 +1495,7 @@ func isStaleActivityMetric(key string) bool {
 		"today_api_cost",
 		"burn_rate",
 		"composer_lines_added", "composer_lines_removed",
-		"composer_files_changed", "scored_commits", "total_prompts":
+		"composer_files_changed":
 		return true
 	}
 	// Fixed-window cost metrics from provider Fetch() are preserved —
@@ -1381,6 +1592,26 @@ func parseMCPToolName(raw string) (server, function string, ok bool) {
 		return rest[:idx], rest[idx+2:], true
 	}
 
+	// Copilot legacy wrapper format: "<server>_mcp_server_<function>".
+	if strings.Contains(raw, "_mcp_server_") {
+		parts := strings.SplitN(raw, "_mcp_server_", 2)
+		server = sanitizeMCPToolSegment(parts[0])
+		function = sanitizeMCPToolSegment(parts[1])
+		if server != "" && function != "" {
+			return server, function, true
+		}
+	}
+
+	// Copilot legacy wrapper format variant: "<server>-mcp-server-<function>".
+	if strings.Contains(raw, "-mcp-server-") {
+		parts := strings.SplitN(raw, "-mcp-server-", 2)
+		server = sanitizeMCPToolSegment(parts[0])
+		function = sanitizeMCPToolSegment(parts[1])
+		if server != "" && function != "" {
+			return server, function, true
+		}
+	}
+
 	// Legacy format: "something (mcp)" from old Cursor data.
 	if strings.HasSuffix(raw, " (mcp)") {
 		body := strings.TrimSuffix(raw, " (mcp)")
@@ -1406,6 +1637,28 @@ func parseMCPToolName(raw string) (server, function string, ok bool) {
 	}
 
 	return "", "", false
+}
+
+func sanitizeMCPToolSegment(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	lastUnderscore := false
+	for _, r := range raw {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteRune('_')
+			lastUnderscore = true
+		}
+	}
+	return strings.Trim(b.String(), "_")
 }
 
 // findServerFunctionSplit finds the best hyphen position to split "server-function"
