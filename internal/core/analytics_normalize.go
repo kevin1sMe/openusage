@@ -1,11 +1,8 @@
 package core
 
 import (
-	"sort"
 	"strings"
 	"time"
-
-	"github.com/samber/lo"
 )
 
 func normalizeAnalyticsDailySeries(s *UsageSnapshot) {
@@ -56,11 +53,7 @@ func aliasInto(s *UsageSnapshot, canonical string, aliases ...string) {
 }
 
 func synthesizeCoreSeriesFromMetrics(s *UsageSnapshot) {
-	today := s.Timestamp
-	if today.IsZero() {
-		today = time.Now()
-	}
-	todayDate := today.Format("2006-01-02")
+	todayDate := analyticsReferenceTime(s).Format("2006-01-02")
 
 	metricUsed := func(keys ...string) float64 {
 		for _, k := range keys {
@@ -98,11 +91,7 @@ func synthesizeModelSeriesFromRecords(s *UsageSnapshot) {
 	if len(s.ModelUsage) == 0 {
 		return
 	}
-	today := s.Timestamp
-	if today.IsZero() {
-		today = time.Now()
-	}
-	date := today.Format("2006-01-02")
+	date := analyticsReferenceTime(s).Format("2006-01-02")
 
 	perModel := make(map[string]float64)
 	for _, rec := range s.ModelUsage {
@@ -158,8 +147,7 @@ func normalizeSeriesPoints(points []TimePoint) []TimePoint {
 		}
 		agg[date] += p.Value
 	}
-	keys := lo.Keys(agg)
-	sort.Strings(keys)
+	keys := SortedStringKeys(agg)
 	out := make([]TimePoint, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, TimePoint{Date: k, Value: agg[k]})
@@ -182,4 +170,11 @@ func normalizeSeriesModelKey(model string) string {
 		return "unknown"
 	}
 	return model
+}
+
+func analyticsReferenceTime(s *UsageSnapshot) time.Time {
+	if s != nil && !s.Timestamp.IsZero() {
+		return s.Timestamp.UTC()
+	}
+	return time.Now().UTC()
 }

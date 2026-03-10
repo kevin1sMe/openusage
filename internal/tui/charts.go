@@ -9,7 +9,6 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/janekbaraniewski/openusage/internal/core"
-	"github.com/samber/lo"
 )
 
 type chartItem struct {
@@ -480,8 +479,7 @@ func RenderBrailleChart(title string, series []BrailleSeries, w, h int, yFmt fun
 		}
 	}
 
-	allDates := lo.Keys(dateSet)
-	sort.Strings(allDates)
+	allDates := core.SortedStringKeys(dateSet)
 
 	startIdx, endIdx := 0, len(allDates)-1
 	for startIdx < endIdx && !dateHasNonZero[allDates[startIdx]] {
@@ -599,7 +597,7 @@ func RenderBrailleChart(title string, series []BrailleSeries, w, h int, yFmt fun
 		axisStyle.Render("└"),
 		axisStyle.Render(strings.Repeat("─", plotW))))
 
-	numLabels := clampInt(plotW/22, 3, 6)
+	numLabels := clamp(plotW/22, 3, 6)
 	if len(allDates) < numLabels {
 		numLabels = len(allDates)
 	}
@@ -835,7 +833,7 @@ func renderStackedTimeChart(title string, series []BrailleSeries, w, h int, yFmt
 
 	sb.WriteString(fmt.Sprintf("  %*s %s%s\n", yAxisW-2, "", axisStyle.Render("└"), axisStyle.Render(strings.Repeat("─", plotW))))
 
-	numLabels := clampInt(plotW/22, 3, 6)
+	numLabels := clamp(plotW/22, 3, 6)
 	if len(labels) < numLabels {
 		numLabels = len(labels)
 	}
@@ -963,7 +961,7 @@ func renderBarTimeChart(title string, series []BrailleSeries, w, h int, yFmt fun
 
 	sb.WriteString(fmt.Sprintf("  %*s %s%s\n", yAxisW-2, "", axisStyle.Render("└"), axisStyle.Render(strings.Repeat("─", plotW))))
 
-	numLabels := clampInt(plotW/22, 3, 6)
+	numLabels := clamp(plotW/22, 3, 6)
 	if len(labels) < numLabels {
 		numLabels = len(labels)
 	}
@@ -1062,8 +1060,7 @@ func alignSeriesByDate(series []BrailleSeries, continuous bool) ([]string, [][]f
 			dateSet[p.Date] = true
 		}
 	}
-	dates := lo.Keys(dateSet)
-	sort.Strings(dates)
+	dates := core.SortedStringKeys(dateSet)
 	if len(dates) == 0 {
 		return nil, nil
 	}
@@ -1263,10 +1260,10 @@ func RenderHeatmap(spec HeatmapSpec, w int) string {
 		copy(values[i], spec.Values[i])
 	}
 
-	rowLabelW := clampInt(w/5, 16, 28)
+	rowLabelW := clamp(w/5, 16, 28)
 	maxCols := spec.MaxCols
 	if maxCols <= 0 {
-		maxCols = clampInt(w-rowLabelW-8, 20, 80)
+		maxCols = clamp(w-rowLabelW-8, 20, 80)
 	}
 	if len(cols) > maxCols {
 		step := float64(len(cols)) / float64(maxCols)

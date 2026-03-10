@@ -2,12 +2,11 @@ package tui
 
 import (
 	"sort"
-	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/janekbaraniewski/openusage/internal/core"
-	"github.com/samber/lo"
 )
 
 const (
@@ -25,6 +24,7 @@ type costData struct {
 	totalOutput   float64
 	providerCount int
 	activeCount   int
+	referenceTime time.Time
 	providers     []providerCostEntry
 	models        []modelCostEntry
 	budgets       []budgetEntry
@@ -145,8 +145,7 @@ func extractCostData(snapshots map[string]core.UsageSnapshot, filter string) cos
 	data.snapshots = snapshots
 	lowerFilter := strings.ToLower(filter)
 
-	keys := lo.Keys(snapshots)
-	sort.Strings(keys)
+	keys := core.SortedStringKeys(snapshots)
 
 	for _, k := range keys {
 		snap := snapshots[k]
@@ -160,6 +159,9 @@ func extractCostData(snapshots map[string]core.UsageSnapshot, filter string) cos
 		data.providerCount++
 		if snap.Status == core.StatusOK || snap.Status == core.StatusNearLimit {
 			data.activeCount++
+		}
+		if snap.Timestamp.After(data.referenceTime) {
+			data.referenceTime = snap.Timestamp
 		}
 
 		provColor := ProviderColor(snap.ProviderID)
@@ -198,247 +200,41 @@ func extractCostData(snapshots map[string]core.UsageSnapshot, filter string) cos
 	}
 
 	data.models = aggregateCanonicalModels(data.providers)
+	if data.referenceTime.IsZero() {
+		data.referenceTime = time.Now()
+	}
 
 	return data
 }
 
 func extractProviderCost(snap core.UsageSnapshot) float64 {
-	modelTotal := 0.0
-	for key, m := range snap.Metrics {
-		if m.Used == nil || *m.Used <= 0 {
-			continue
-		}
-		if strings.HasPrefix(key, "model_") && (strings.HasSuffix(key, "_cost") || strings.HasSuffix(key, "_cost_usd")) {
-			modelTotal += *m.Used
-		}
-	}
-	if modelTotal > 0 {
-		return modelTotal
-	}
-
-	for _, key := range []string{
-		"total_cost_usd",
-		"plan_total_spend_usd",
-		"all_time_api_cost",
-		"jsonl_total_cost_usd",
-		"today_api_cost",
-		"daily_cost_usd",
-		"5h_block_cost",
-		"block_cost_usd",
-		"individual_spend",
-		"credits",
-	} {
-		if m, ok := snap.Metrics[key]; ok && m.Used != nil && *m.Used > 0 {
-			return *m.Used
-		}
-	}
-
-	return 0
+	return core.ExtractAnalyticsCostSummary(snap).TotalCostUSD
 }
 
 func extractTodayCost(snap core.UsageSnapshot) float64 {
-	for _, key := range []string{"today_api_cost", "daily_cost_usd", "today_cost", "usage_daily"} {
-		if m, ok := snap.Metrics[key]; ok && m.Used != nil && *m.Used > 0 {
-			return *m.Used
-		}
-	}
-	return 0
+	return core.ExtractAnalyticsCostSummary(snap).TodayCostUSD
 }
 
 func extract7DayCost(snap core.UsageSnapshot) float64 {
-	for _, key := range []string{"7d_api_cost", "usage_weekly"} {
-		if m, ok := snap.Metrics[key]; ok && m.Used != nil && *m.Used > 0 {
-			return *m.Used
-		}
-	}
-	return 0
+	return core.ExtractAnalyticsCostSummary(snap).WeekCostUSD
 }
 
 func extractAllModels(snap core.UsageSnapshot, provColor lipgloss.Color) []modelCostEntry {
-	if len(snap.ModelUsage) > 0 {
-		return extractAllModelsFromRecords(snap)
-	}
-
-	type md struct {
-		cost   float64
-		input  float64
-		output float64
-	}
-	models := make(map[string]*md)
-	var order []string
-
-	ensure := func(name string) *md {
-		if _, ok := models[name]; !ok {
-			models[name] = &md{}
-			order = append(order, name)
-		}
-		return models[name]
-	}
-
-	for key, m := range snap.Metrics {
-		if !strings.HasPrefix(key, "model_") {
-			continue
-		}
-		name := strings.TrimPrefix(key, "model_")
-		switch {
-		case strings.HasSuffix(name, "_cost_usd"):
-			name = strings.TrimSuffix(name, "_cost_usd")
-			if m.Used != nil && *m.Used > 0 {
-				ensure(name).cost += *m.Used
-			}
-		case strings.HasSuffix(name, "_cost"):
-			name = strings.TrimSuffix(name, "_cost")
-			if m.Used != nil && *m.Used > 0 {
-				ensure(name).cost += *m.Used
-			}
-		case strings.HasSuffix(name, "_input_tokens"):
-			name = strings.TrimSuffix(name, "_input_tokens")
-			if m.Used != nil {
-				ensure(name).input += *m.Used
-			}
-		case strings.HasSuffix(name, "_output_tokens"):
-			name = strings.TrimSuffix(name, "_output_tokens")
-			if m.Used != nil {
-				ensure(name).output += *m.Used
-			}
-		}
-	}
-
-	for key, val := range snap.Raw {
-		if !strings.HasPrefix(key, "model_") {
-			continue
-		}
-		name := strings.TrimPrefix(key, "model_")
-		switch {
-		case strings.HasSuffix(name, "_input_tokens"):
-			name = strings.TrimSuffix(name, "_input_tokens")
-			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
-				m := ensure(name)
-				if m.input == 0 {
-					m.input = v
-				}
-			}
-		case strings.HasSuffix(name, "_output_tokens"):
-			name = strings.TrimSuffix(name, "_output_tokens")
-			if v, err := strconv.ParseFloat(val, 64); err == nil && v > 0 {
-				m := ensure(name)
-				if m.output == 0 {
-					m.output = v
-				}
-			}
-		}
-	}
-
-	for key, m := range snap.Metrics {
-		switch {
-		case strings.HasPrefix(key, "input_tokens_"):
-			name := strings.TrimPrefix(key, "input_tokens_")
-			if m.Used != nil && *m.Used > 0 {
-				ensure(name).input += *m.Used
-			}
-		case strings.HasPrefix(key, "output_tokens_"):
-			name := strings.TrimPrefix(key, "output_tokens_")
-			if m.Used != nil && *m.Used > 0 {
-				ensure(name).output += *m.Used
-			}
-		}
-	}
-
-	var result []modelCostEntry
-	for _, name := range order {
-		d := models[name]
-		if d.cost > 0 || d.input > 0 || d.output > 0 {
-			result = append(result, modelCostEntry{
-				name:         prettifyModelName(name),
-				provider:     snap.AccountID,
-				cost:         d.cost,
-				inputTokens:  d.input,
-				outputTokens: d.output,
-				color:        stableModelColor(name, snap.AccountID),
-			})
-		}
-	}
-	return result
-}
-
-func extractAllModelsFromRecords(snap core.UsageSnapshot) []modelCostEntry {
-	type md struct {
-		cost       float64
-		input      float64
-		output     float64
-		confidence float64
-		window     string
-	}
-	models := make(map[string]*md)
-	var order []string
-
-	ensure := func(name string) *md {
-		if _, ok := models[name]; !ok {
-			models[name] = &md{}
-			order = append(order, name)
-		}
-		return models[name]
-	}
-
-	for _, rec := range snap.ModelUsage {
-		name := modelRecordDisplayName(rec)
-		if name == "" {
-			continue
-		}
-		md := ensure(name)
-		if rec.CostUSD != nil && *rec.CostUSD > 0 {
-			md.cost += *rec.CostUSD
-		}
-		if rec.InputTokens != nil {
-			md.input += *rec.InputTokens
-		}
-		if rec.OutputTokens != nil {
-			md.output += *rec.OutputTokens
-		}
-		if rec.TotalTokens != nil && rec.InputTokens == nil && rec.OutputTokens == nil {
-			md.input += *rec.TotalTokens
-		}
-		if rec.Confidence > md.confidence {
-			md.confidence = rec.Confidence
-		}
-		if md.window == "" {
-			md.window = rec.Window
-		}
-	}
-
-	result := make([]modelCostEntry, 0, len(order))
-	for _, name := range order {
-		md := models[name]
-		if md.cost <= 0 && md.input <= 0 && md.output <= 0 {
-			continue
-		}
+	records := core.ExtractAnalyticsModelUsage(snap)
+	result := make([]modelCostEntry, 0, len(records))
+	for _, record := range records {
 		result = append(result, modelCostEntry{
-			name:         prettifyModelName(name),
+			name:         prettifyModelName(record.Name),
 			provider:     snap.AccountID,
-			cost:         md.cost,
-			inputTokens:  md.input,
-			outputTokens: md.output,
-			color:        stableModelColor(name, snap.AccountID),
-			confidence:   md.confidence,
-			window:       md.window,
+			cost:         record.CostUSD,
+			inputTokens:  record.InputTokens,
+			outputTokens: record.OutputTokens,
+			color:        stableModelColor(record.Name, snap.AccountID),
+			confidence:   record.Confidence,
+			window:       record.Window,
 		})
 	}
 	return result
-}
-
-func modelRecordDisplayName(rec core.ModelUsageRecord) string {
-	if rec.Dimensions != nil {
-		if groupID := strings.TrimSpace(rec.Dimensions["canonical_group_id"]); groupID != "" {
-			return groupID
-		}
-	}
-	if strings.TrimSpace(rec.RawModelID) != "" {
-		return rec.RawModelID
-	}
-	if strings.TrimSpace(rec.CanonicalLineageID) != "" {
-		return rec.CanonicalLineageID
-	}
-	return "unknown"
 }
 
 func aggregateCanonicalModels(providers []providerCostEntry) []modelCostEntry {

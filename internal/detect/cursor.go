@@ -48,19 +48,18 @@ func detectCursor(result *Result) {
 		ID:        "cursor-ide",
 		Provider:  "cursor",
 		Auth:      "local",
-		Paths:     make(map[string]string),
 		ExtraData: make(map[string]string),
 	}
 
 	if hasTracking {
-		acct.Paths["tracking_db"] = trackingDB
+		acct.SetPath("tracking_db", trackingDB)
+		acct.SetHint("tracking_db", trackingDB)
 		acct.ExtraData["tracking_db"] = trackingDB
-		acct.Binary = trackingDB // compat fallback
 	}
 	if hasState {
-		acct.Paths["state_db"] = stateDB
+		acct.SetPath("state_db", stateDB)
+		acct.SetHint("state_db", stateDB)
 		acct.ExtraData["state_db"] = stateDB
-		acct.BaseURL = stateDB // compat fallback
 	}
 
 	if hasState {

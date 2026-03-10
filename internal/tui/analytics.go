@@ -9,29 +9,19 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/janekbaraniewski/openusage/internal/core"
-	"github.com/samber/lo"
 )
 
 func (m Model) renderAnalyticsContent(w, h int) string {
-	data := extractCostData(m.visibleSnapshots(), m.analyticsFilter.text)
-	sortProviders(data.providers, m.analyticsSortBy)
-	sortModels(data.models, m.analyticsSortBy)
-	summary := computeAnalyticsSummary(data)
-
 	var statusBuf strings.Builder
 	renderStatusBar(&statusBuf, m.analyticsSortBy, m.analyticsFilter.text, w)
 	statusStr := statusBuf.String()
 
-	hasData := data.totalCost > 0 || len(data.models) > 0 || len(data.budgets) > 0 ||
-		len(data.usageGauges) > 0 || len(data.tokenActivity) > 0 || len(data.timeSeries) > 0
-
+	content, hasData := m.cachedAnalyticsPageContent(w)
 	if !hasData {
 		empty := "\n" + dimStyle.Render("  No cost or usage data available.")
 		empty += "\n" + dimStyle.Render("  Analytics requires providers that report spend, tokens, or budgets.")
 		return statusStr + empty
 	}
-
-	content := renderAnalyticsSinglePage(data, summary, w)
 
 	lines := strings.Split(statusStr+content, "\n")
 	for len(lines) < h {
@@ -263,8 +253,8 @@ func renderTopModelsSummary(models []modelCostEntry, w int, limit int) string {
 	sb.WriteString("  " + sectionStyle.Render("TOP MODELS (Daily volume & efficiency)") + "\n")
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSurface1).Render(strings.Repeat("─", w-4)) + "\n")
 
-	nameW := clampInt(w/3, 20, 34)
-	provW := clampInt(w/5, 14, 22)
+	nameW := clamp(w/3, 20, 34)
+	provW := clamp(w/5, 14, 22)
 	tokW := 12
 	costW := 10
 	effW := 10
@@ -317,8 +307,8 @@ func renderTopModelsCompact(models []modelCostEntry, w int, limit int) string {
 	sb.WriteString("  " + sectionStyle.Render("TOP MODELS (compact)") + "\n")
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSurface1).Render(strings.Repeat("─", w-4)) + "\n")
 
-	nameW := clampInt(w/2, 16, 26)
-	provW := clampInt(w/4, 10, 16)
+	nameW := clamp(w/2, 16, 26)
+	provW := clamp(w/4, 10, 16)
 	tokW := 9
 	effW := 9
 
@@ -385,8 +375,8 @@ func renderCostTableCompact(data costData, w int, limit int) string {
 	sb.WriteString("  " + sectionStyle.Render("COST & SPEND (compact)") + "\n")
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSurface1).Render(strings.Repeat("─", w-4)) + "\n")
 
-	provW := clampInt(w/3, 14, 24)
-	colW := clampInt((w-provW-8)/3, 8, 12)
+	provW := clamp(w/3, 14, 24)
+	colW := clamp((w-provW-8)/3, 8, 12)
 	head := dimStyle.Copy().Bold(true)
 	sb.WriteString("  " + padRight(head.Render("Provider"), provW) + " " +
 		padLeft(head.Render("Today"), colW) + " " +
@@ -522,7 +512,7 @@ func buildProviderDailyCostSeries(data costData) ([]BrailleSeries, int, int) {
 		if gg, ok := groupByProvider[p.name]; ok {
 			g = &gg
 		}
-		pts, observed, estimated := deriveProviderDailyCostPoints(p, g)
+		pts, observed, estimated := deriveProviderDailyCostPoints(p, g, data.referenceTime)
 		if !hasNonZeroData(pts) {
 			continue
 		}
@@ -563,7 +553,7 @@ func buildProviderDailyCostSeries(data costData) ([]BrailleSeries, int, int) {
 	return out, observedCount, estimatedCount
 }
 
-func deriveProviderDailyCostPoints(p providerCostEntry, group *timeSeriesGroup) ([]core.TimePoint, bool, bool) {
+func deriveProviderDailyCostPoints(p providerCostEntry, group *timeSeriesGroup, referenceTime time.Time) ([]core.TimePoint, bool, bool) {
 	if group != nil {
 		for _, key := range []string{"cost", "analytics_cost", "daily_cost"} {
 			if pts, ok := group.series[key]; ok && hasNonZeroData(pts) {
@@ -571,8 +561,10 @@ func deriveProviderDailyCostPoints(p providerCostEntry, group *timeSeriesGroup) 
 			}
 		}
 	}
-	now := time.Now()
-	nowDate := now.Format("2006-01-02")
+	if referenceTime.IsZero() {
+		referenceTime = time.Now()
+	}
+	nowDate := referenceTime.Format("2006-01-02")
 
 	if p.todayCost > 0 {
 		return []core.TimePoint{{Date: nowDate, Value: p.todayCost}}, true, false
@@ -622,8 +614,7 @@ func aggregateSeriesByDate(series []BrailleSeries) []core.TimePoint {
 	if len(byDate) == 0 {
 		return nil
 	}
-	dates := lo.Keys(byDate)
-	sort.Strings(dates)
+	dates := core.SortedStringKeys(byDate)
 	out := make([]core.TimePoint, 0, len(dates))
 	for _, d := range dates {
 		out = append(out, core.TimePoint{Date: d, Value: byDate[d]})
@@ -655,30 +646,12 @@ func buildProviderModelTokenDistributionSeries(data costData, limit int) []Brail
 	var cands []candidate
 
 	for _, g := range data.timeSeries {
-		keys := lo.Keys(g.series)
-		sort.Strings(keys)
-		tokenKeys := make([]string, 0, len(keys))
-		usageKeys := make([]string, 0, len(keys))
-		for _, key := range keys {
-			if strings.HasPrefix(key, "tokens_") {
-				tokenKeys = append(tokenKeys, key)
-			} else if strings.HasPrefix(key, "usage_model_") {
-				usageKeys = append(usageKeys, key)
-			}
-		}
-		modelKeys := tokenKeys
-		if len(modelKeys) == 0 {
-			modelKeys = usageKeys
-		}
-		for _, key := range modelKeys {
-			pts := clipSeriesPointsByRecentDates(g.series[key], 30)
+		for _, named := range core.ExtractAnalyticsModelSeries(g.series) {
+			pts := clipSeriesPointsByRecentDates(named.Points, 30)
 			if !hasNonZeroData(pts) {
 				continue
 			}
-
-			model := key
-			model = strings.TrimPrefix(model, "tokens_")
-			model = strings.TrimPrefix(model, "usage_model_")
+			model := named.Name
 			label := truncStr(prettifyModelName(model)+" · "+g.providerName, 34)
 
 			cands = append(cands, candidate{
@@ -710,28 +683,8 @@ func buildProviderModelTokenDistributionSeries(data costData, limit int) []Brail
 }
 
 func selectBestProviderCostWeightSeries(series map[string][]core.TimePoint) []core.TimePoint {
-	for _, key := range []string{
-		"tokens_total",
-		"messages",
-		"sessions",
-		"tool_calls",
-		"requests",
-		"tab_accepted",
-		"composer_accepted",
-	} {
-		if pts, ok := series[key]; ok && hasNonZeroData(pts) {
-			return pts
-		}
-	}
-	keys := lo.Keys(series)
-	sort.Strings(keys)
-	for _, key := range keys {
-		if strings.HasPrefix(key, "tokens_") || strings.HasPrefix(key, "usage_model_") || strings.HasPrefix(key, "usage_client_") {
-			pts := series[key]
-			if hasNonZeroData(pts) {
-				return pts
-			}
-		}
+	if pts := core.SelectAnalyticsWeightSeries(series); hasNonZeroData(pts) {
+		return pts
 	}
 	return nil
 }
@@ -747,13 +700,8 @@ func buildProviderModelHeatmapSpec(data costData, maxRows int, lastDays int) (He
 	dateSet := make(map[string]bool)
 
 	for _, g := range data.timeSeries {
-		keys := lo.Keys(g.series)
-		sort.Strings(keys)
-		for _, key := range keys {
-			pts := g.series[key]
-			if !strings.HasPrefix(key, "tokens_") {
-				continue
-			}
+		for _, named := range core.ExtractAnalyticsModelSeries(g.series) {
+			pts := named.Points
 			total := seriesTotal(pts)
 			if total <= 0 {
 				continue
@@ -765,10 +713,10 @@ func buildProviderModelHeatmapSpec(data costData, maxRows int, lastDays int) (He
 					dateSet[p.Date] = true
 				}
 			}
-			model := prettifyModelName(strings.TrimPrefix(key, "tokens_"))
+			model := prettifyModelName(named.Name)
 			rows = append(rows, row{
 				label: truncStr(g.providerName+" · "+model, 42),
-				color: stableModelColor(key, g.providerID),
+				color: stableModelColor(named.Name, g.providerID),
 				vals:  vals,
 				total: total,
 			})
@@ -783,8 +731,7 @@ func buildProviderModelHeatmapSpec(data costData, maxRows int, lastDays int) (He
 		rows = rows[:maxRows]
 	}
 
-	dates := lo.Keys(dateSet)
-	sort.Strings(dates)
+	dates := core.SortedStringKeys(dateSet)
 	dates = clipDatesToRecent(dates, lastDays)
 
 	labels := make([]string, len(rows))
@@ -892,10 +839,8 @@ func computeAnalyticsSummary(data costData) analyticsSummary {
 			}
 		}
 		if !hasTotalTokens {
-			for key, pts := range g.series {
-				if !strings.HasPrefix(key, "tokens_") {
-					continue
-				}
+			for _, named := range core.ExtractAnalyticsModelSeries(g.series) {
+				pts := named.Points
 				for _, p := range pts {
 					tokensByDate[p.Date] += p.Value
 				}
@@ -909,9 +854,9 @@ func computeAnalyticsSummary(data costData) analyticsSummary {
 		}
 	}
 
-	s.dailyCost = mapToSortedPoints(costByDate)
-	s.dailyTokens = mapToSortedPoints(tokensByDate)
-	s.dailyMessages = mapToSortedPoints(messagesByDate)
+	s.dailyCost = core.SortedTimePoints(costByDate)
+	s.dailyTokens = core.SortedTimePoints(tokensByDate)
+	s.dailyMessages = core.SortedTimePoints(messagesByDate)
 	s.activeDays = countNonZeroDays(s.dailyCost, s.dailyTokens, s.dailyMessages)
 
 	s.peakCostDate, s.peakCost = maxPoint(s.dailyCost)
@@ -933,17 +878,6 @@ func computeAnalyticsSummary(data costData) analyticsSummary {
 		s.dayOfWeekCount[wd]++
 	}
 	return s
-}
-
-func mapToSortedPoints(m map[string]float64) []core.TimePoint {
-	keys := lo.Keys(m)
-	sort.Strings(keys)
-
-	out := make([]core.TimePoint, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, core.TimePoint{Date: k, Value: m[k]})
-	}
-	return out
 }
 
 func maxPoint(points []core.TimePoint) (string, float64) {
@@ -1086,16 +1020,6 @@ func filterTokenModels(models []modelCostEntry) []modelCostEntry {
 	return out
 }
 
-func clampInt(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
-}
-
 func truncStr(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
@@ -1104,7 +1028,5 @@ func truncStr(s string, maxLen int) string {
 }
 
 func sortedMetricKeys(m map[string]core.Metric) []string {
-	keys := lo.Keys(m)
-	sort.Strings(keys)
-	return keys
+	return core.SortedStringKeys(m)
 }
