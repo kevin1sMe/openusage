@@ -7,10 +7,14 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/providers/providerbase"
 	"github.com/janekbaraniewski/openusage/internal/providers/shared"
+)
+
+var (
+	loadBrowserSession = shared.LoadOrRefreshBrowserSession
+	newConsoleClient   = NewConsoleClient
 )
 
 // OpenCode Zen exposes only OpenAI-compatible chat/messages/models endpoints
@@ -54,7 +58,7 @@ func New() *Provider {
 			Setup: core.ProviderSetupSpec{
 				Quickstart: []string{
 					"Set OPENCODE_API_KEY (or ZEN_API_KEY) with your OpenCode Zen key for chat-surface auth.",
-					"For balance / monthly usage / subscription data: open Settings → 5 KEYS, navigate to opencode-console, and press Enter to import the session cookie from your browser.",
+					"For balance / monthly usage / subscription data: open Settings → 5 KEYS, highlight opencode, and press c to import the session cookie from your browser.",
 					"Tile spend / model / activity metrics are populated from the OpenCode telemetry plugin; see Settings → 7 INTEG.",
 				},
 			},
@@ -146,22 +150,21 @@ var errNoCookieConfigured = errors.New("opencode: no browser session configured"
 // metrics + attributes. Returns errNoCookieConfigured when the user hasn't
 // opted in to browser-session auth.
 func (p *Provider) enrichFromConsole(ctx context.Context, acct core.AccountConfig, snap *core.UsageSnapshot) error {
-	session, ok, err := config.LoadSession(acct.ID)
+	session, ok, err := loadBrowserSession(ctx, acct, nil)
 	if err != nil || !ok || session.Value == "" {
 		return errNoCookieConfigured
 	}
+
+	client := newConsoleClient(session.Value, session.CookieName, "")
 	workspaceID := strings.TrimSpace(acct.Hint("opencode_workspace_id", ""))
 	if workspaceID == "" {
-		// First-time setup: workspace id discovery requires another RPC
-		// call we haven't implemented yet (queryWorkspaces). For now, the
-		// account config can override it via a "opencode_workspace_id"
-		// extra-data hint. Without it we surface a clear diagnostic
-		// rather than silently noop.
-		snap.SetDiagnostic("opencode_console_setup_hint", "set extra_data.opencode_workspace_id on the account to enable console enrichment")
-		return errNoCookieConfigured
+		workspaceID, err = client.DiscoverWorkspaceID(ctx)
+		if err != nil {
+			snap.SetDiagnostic("opencode_console_workspace_error", err.Error())
+			return errNoCookieConfigured
+		}
 	}
-
-	client := NewConsoleClient(session.Value, session.CookieName, workspaceID)
+	client.WorkspaceID = workspaceID
 	billing, err := client.QueryBillingInfo(ctx)
 	if err != nil {
 		return err

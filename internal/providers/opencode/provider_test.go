@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/janekbaraniewski/openusage/internal/browsercookies"
+	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
@@ -120,5 +122,74 @@ func TestFetch_RateLimited_429(t *testing.T) {
 	}
 	if snap.Status != core.StatusLimited {
 		t.Errorf("status = %s, want LIMITED on 429", snap.Status)
+	}
+}
+
+func TestFetch_ConsoleEnrichmentAutoDiscoversWorkspaceID(t *testing.T) {
+	origLoadBrowserSession := loadBrowserSession
+	origNewConsoleClient := newConsoleClient
+	t.Cleanup(func() {
+		loadBrowserSession = origLoadBrowserSession
+		newConsoleClient = origNewConsoleClient
+	})
+
+	loadBrowserSession = func(context.Context, core.AccountConfig, browsercookies.Reader) (config.BrowserSession, bool, error) {
+		return config.BrowserSession{
+			Value:         "test-cookie-value",
+			CookieName:    "auth",
+			SourceBrowser: "firefox",
+		}, true, nil
+	}
+
+	billing := loadFixture(t, "seroval_c83b78a61468.txt")
+	var discoveredWorkspaceID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == modelsPath:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(zenModelsBody()))
+		case r.URL.Path == "/auth":
+			http.Redirect(w, r, "/workspace/wrk_DISCOVERED", http.StatusFound)
+		case r.URL.Path == "/_server":
+			discoveredWorkspaceID = r.URL.Query().Get("args")
+			w.Header().Set("Content-Type", "text/javascript")
+			_, _ = w.Write(billing)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	newConsoleClient = func(cookieValue, cookieName, workspaceID string) *ConsoleClient {
+		client := NewConsoleClient(cookieValue, cookieName, workspaceID)
+		client.baseURL = server.URL
+		return client
+	}
+
+	acct := newAcct(t, server.URL)
+	acct.BrowserCookie = &core.BrowserCookieRef{
+		Domain:        ".opencode.ai",
+		CookieName:    "auth",
+		SourceBrowser: "firefox",
+	}
+
+	snap, err := New().Fetch(context.Background(), acct)
+	if err != nil {
+		t.Fatalf("Fetch error: %v", err)
+	}
+	if snap.Status != core.StatusOK {
+		t.Fatalf("status = %s (msg=%q), want OK", snap.Status, snap.Message)
+	}
+	if got := snap.Attributes["auth_scope"]; got != "zen+console" {
+		t.Fatalf("auth_scope = %q, want zen+console", got)
+	}
+	if _, ok := snap.Metrics["console_balance"]; !ok {
+		t.Fatal("console_balance metric missing after workspace auto-discovery")
+	}
+	if strings.Contains(discoveredWorkspaceID, "wrk_DISCOVERED") == false {
+		t.Fatalf("billing request args missing discovered workspace: %q", discoveredWorkspaceID)
+	}
+	if _, ok := snap.Diagnostics["opencode_console_workspace_error"]; ok {
+		t.Fatalf("unexpected workspace discovery diagnostic: %+v", snap.Diagnostics)
 	}
 }

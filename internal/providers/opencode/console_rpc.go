@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -39,6 +40,8 @@ const (
 	// a year/month. Args: [workspaceID, year, month, tz].
 	rpcUsageMonthID = "15702f3a12ff8bff357f8c2aa154a17e65b746d5f6b96adc9002c86ee0c15205"
 )
+
+var workspaceRedirectRE = regexp.MustCompile(`/workspace/([^/?#]+)`)
 
 // ConsoleClient is a minimal SolidStart RPC client for the OpenCode console.
 // Cookie-authed; never writes mutations.
@@ -165,13 +168,56 @@ func (c *ConsoleClient) callPOST(ctx context.Context, fnID string, args ...any) 
 
 func (c *ConsoleClient) applyHeaders(req *http.Request, fnID string) {
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("x-server-id", fnID)
-	req.Header.Set("x-server-instance", "openusage")
+	if fnID != "" {
+		req.Header.Set("x-server-id", fnID)
+		req.Header.Set("x-server-instance", "openusage")
+	}
 	// Cookie header — single cookie, not a full jar. The session cookie
 	// is the only one we need; OpenCode's console doesn't gate on
 	// CSRF/anti-forgery for these GETs.
 	req.AddCookie(&http.Cookie{Name: c.CookieName, Value: c.Cookie})
 	req.Header.Set("User-Agent", "openusage/console-client")
+}
+
+// DiscoverWorkspaceID resolves the user's last-seen workspace by following the
+// same authenticated redirect the OpenCode console uses for `/auth`.
+func (c *ConsoleClient) DiscoverWorkspaceID(ctx context.Context) (string, error) {
+	if c.Cookie == "" || c.CookieName == "" {
+		return "", errors.New("console: missing session cookie")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/auth", nil)
+	if err != nil {
+		return "", fmt.Errorf("console: auth redirect request: %w", err)
+	}
+	c.applyHeaders(req, "")
+
+	client := *c.httpClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("console: auth redirect request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	location := resp.Header.Get("Location")
+	if location == "" {
+		if resp.Request != nil && resp.Request.URL != nil {
+			location = resp.Request.URL.String()
+		}
+	}
+	matches := workspaceRedirectRE.FindStringSubmatch(location)
+	if len(matches) == 2 && strings.TrimSpace(matches[1]) != "" {
+		return matches[1], nil
+	}
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", &ConsoleAuthError{StatusCode: resp.StatusCode, Body: "workspace discovery unauthorized"}
+	}
+	if location != "" {
+		return "", fmt.Errorf("console: workspace redirect missing id (%s)", location)
+	}
+	return "", fmt.Errorf("console: workspace redirect missing id (HTTP %d)", resp.StatusCode)
 }
 
 func (c *ConsoleClient) do(req *http.Request) ([]byte, error) {

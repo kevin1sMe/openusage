@@ -122,3 +122,43 @@ func TestConsoleClient_QueryUsageMonth_PostsArgsBody(t *testing.T) {
 		t.Errorf("Keys = %d, want 2", len(got.Keys))
 	}
 }
+
+func TestConsoleClient_DiscoverWorkspaceID_FromAuthRedirect(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/en/workspace/wrk_DISCOVERED/billing", http.StatusFound)
+	}))
+	defer server.Close()
+
+	c := NewConsoleClient("test-cookie-value", "auth", "")
+	c.baseURL = server.URL
+
+	workspaceID, err := c.DiscoverWorkspaceID(context.Background())
+	if err != nil {
+		t.Fatalf("DiscoverWorkspaceID error: %v", err)
+	}
+	if workspaceID != "wrk_DISCOVERED" {
+		t.Fatalf("workspaceID = %q, want wrk_DISCOVERED", workspaceID)
+	}
+}
+
+func TestConsoleClient_DiscoverWorkspaceID_MissingRedirectID(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/auth" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/auth/authorize", http.StatusFound)
+	}))
+	defer server.Close()
+
+	c := NewConsoleClient("test-cookie-value", "auth", "")
+	c.baseURL = server.URL
+
+	if _, err := c.DiscoverWorkspaceID(context.Background()); err == nil {
+		t.Fatal("expected missing workspace redirect error")
+	}
+}
