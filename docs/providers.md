@@ -101,15 +101,18 @@ Tracks rate limits and account balance.
 For providers whose billing / usage / account data is gated by web-console
 session cookies and never exposed via API key, openusage supports a
 "connect via browser" flow that reads the session cookie directly out of
-your default browser's cookie jar (Chrome / Firefox / Safari / Edge /
+your chosen browser's cookie jar (Chrome / Firefox / Safari / Edge /
 Brave on macOS / Linux / Windows).
 
 **How to connect**: Settings → 5 KEYS → navigate to the provider row →
-press Enter. Openusage reads the `(domain, cookie name)` pair declared by
-the provider, persists it encrypted-at-rest in the credentials store, and
-uses it on every poll. When the cookie expires, the tile transitions to
-AUTH with a "re-login at console.X.com" hint; logging into the site again
-in your browser refreshes openusage on the next poll automatically.
+press Enter for browser-session-only providers (for example Perplexity),
+or press `c` on mixed-auth providers (for example OpenCode). Openusage
+opens a browser picker, reads the `(domain, cookie name)` pair declared by
+the provider, stores the cookie in `credentials.json` with `0600`
+permissions, and uses it on every poll. When the cookie expires, the tile
+transitions to AUTH with a "re-login at console.X.com" hint; logging into
+the site again in your browser refreshes openusage on the next poll
+automatically.
 
 **Privacy**: opt-in per-account, scoped to a single (domain, cookie name)
 pair, never sent off-machine. macOS will prompt for Keychain access the
@@ -167,11 +170,10 @@ Browser-session-auth-only — Perplexity's API key is chat-only. Tile surfaces t
 
 ### OpenCode (Zen + Console)
 
-**Detection:** `OPENCODE_API_KEY` / `ZEN_API_KEY` env var for chat-surface auth, optionally a browser-session cookie from `console.opencode.ai` for billing data.
+**Detection:** `OPENCODE_API_KEY` / `ZEN_API_KEY` env var for chat-surface auth, optionally a browser-session cookie from `opencode.ai` for billing data.
 
-Two-tier auth. The API key probes `/zen/v1/models` for chat-side validation and surfaces the available Zen model count. When connected via browser session (Settings → 5 KEYS → opencode → Enter), the tile gains balance, monthly limit / monthly usage, auto-reload settings, payment method, and subscription state from the SolidStart server-fn endpoints at `opencode.ai/_server`.
-
-Workspace ID required for console enrichment — set `extra_data.opencode_workspace_id` on the account config. Auto-discovery is a follow-up.
+Two-tier auth. The API key probes `/zen/v1/models` for chat-side validation and surfaces the available Zen model count. When connected via browser session (Settings → 5 KEYS → opencode → `c`), the tile gains balance, monthly limit / monthly usage, auto-reload settings, payment method, and subscription state from the SolidStart server-fn endpoints at `opencode.ai/_server`.
+Openusage auto-discovers the active workspace ID from the authenticated console redirect, so no extra account hint is required for console enrichment.
 
 ### Moonshot (Kimi)
 

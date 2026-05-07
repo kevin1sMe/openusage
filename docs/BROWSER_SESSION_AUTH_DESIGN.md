@@ -35,7 +35,7 @@ We need a way to get the cookie from the user's existing logged-in browser into 
 1. Zero copy-paste UX. The user clicks one thing and is done.
 2. Works on macOS / Linux / Windows.
 3. Works for Chrome / Safari / Firefox (the dominant ~95% of browsers).
-4. Cookie storage in openusage is encrypted-at-rest (Keychain / libsecret / DPAPI, NOT plain JSON).
+4. Cookie storage in openusage uses the same `0600` credentials-store file as API keys.
 5. Auth refresh story is honest: when the cookie expires, the tile transitions to AUTH with a clear "log into provider.com to refresh" hint and re-extracts on next poll.
 6. **Universal — one infrastructure, every dashboard-gated provider benefits.** Cover at minimum: OpenAI (platform + ChatGPT), Anthropic (console), Google AI Studio, OpenCode (Zen), Perplexity. Cursor already has equivalent local-extraction; same pattern.
 7. Clear, explicit user consent — first time openusage reads a browser cookie, the user is prompted and informed, not surprised.
@@ -59,7 +59,7 @@ We need a way to get the cookie from the user's existing logged-in browser into 
 | core types | minor | New `ProviderAuthTypeBrowserSession` constant; new `BrowserCookieRef` field on `AccountConfig` for the persisted reference. |
 | providers | moderate | OpenCode + Perplexity gain a cookie-fed code path alongside their existing API-key probe. Other providers untouched. |
 | TUI | moderate | New row type in 5 KEYS for cookie-auth providers, "Connect via browser" action, refresh flow on expiry. |
-| config | minor | Cookie blob stored in the existing credentials store with a new `kind: "browser_session"` discriminator. Same encryption-at-rest as API keys. |
+| config | minor | Cookie blob stored in the existing credentials store alongside API keys, protected by the same `0600` filesystem permissions. |
 | detect | minor | Optional: detect "user is logged into provider X in browser Y" passively for the UI hint, not for auto-extraction. |
 | daemon | none | The daemon poll path stays unchanged — it consumes whatever credential the provider hands it. |
 | telemetry | none | |
@@ -93,36 +93,40 @@ On every poll, openusage re-reads the cookie fresh from the source browser. If e
 In **Settings → 5 KEYS** for cookie-auth-capable providers, the row shows:
 
 ```
-  ▸ opencode-zen     │ STATUS │ <not connected>
+  ▸ perplexity       │ STATUS │ <not connected>
                        press Enter to connect via browser
 ```
 
-On Enter:
+For browser-session-only providers, Enter starts the connect flow. For
+mixed-auth providers such as OpenCode, Enter still edits the primary API key
+and `c` starts the browser-session flow.
 
-1. TUI displays a modal:
+On connect:
+
+1. TUI enumerates installed browser cookie stores and shows a picker:
    ```
-   ┌── Connect OpenCode (cookie auth) ──────────────────────────┐
-   │ openusage will read your opencode.ai session cookie from   │
-   │ your browser to fetch billing and usage data.              │
+   ┌── Choose browser to read cookie from ──────────────────────┐
+   │ perplexity · .perplexity.ai                                │
    │                                                            │
-   │ This requires you to be logged into opencode.ai in one of: │
-   │   • Google Chrome / Edge / Brave / Vivaldi                 │
-   │   • Firefox                                                │
-   │   • Safari (macOS only)                                    │
+   │ openusage will read the declared session cookie from the   │
+   │ browser you pick here.                                     │
    │                                                            │
-   │ The cookie is stored encrypted at rest in your             │
-   │ openusage credentials store. It's read fresh from the      │
-   │ browser on every poll.                                     │
+   │   ➤ firefox   (no prompt)                                  │
+   │     chrome    (keychain prompt)                            │
    │                                                            │
-   │   y  open opencode.ai in your default browser              │
-   │   r  read cookie now (already logged in)                   │
-   │   esc cancel                                               │
+   │   Enter  read cookie                                       │
+   │   b      open provider site in default browser             │
+   │   Esc    cancel                                            │
    └────────────────────────────────────────────────────────────┘
    ```
 
-2. User picks `r` (already logged in) — openusage tries each supported browser in turn for `.opencode.ai/auth`. First hit wins, gets stored, tile flips to OK.
+2. User picks the browser they already use for that provider. Openusage reads
+   only that browser's cookie store, which avoids a cascade of macOS keychain
+   prompts across every Chromium-family browser on the machine.
 
-3. User picks `y` — openusage `exec.Command("open", "https://opencode.ai/login")` (and platform equivalents), modal shows "Waiting for you to finish logging in… [r] read now [esc] cancel". User logs in, returns to TUI, presses `r`. Same extraction as path (2).
+3. If the user is not logged in yet, `b` opens the provider site in the
+   default browser. They log in there, return to the TUI, and run the same
+   read flow.
 
 4. **No copy-paste.** No "open DevTools and copy". The user only ever logs into the provider's site like normal.
 
@@ -133,12 +137,12 @@ Two artifacts:
 **Per-account reference** (in the account's config — non-sensitive):
 ```json
 {
-  "id": "opencode-zen",
-  "provider": "opencode",
+  "id": "perplexity",
+  "provider": "perplexity",
   "auth": "browser_session",
-  "browser_cookie_ref": {
-    "domain": ".opencode.ai",
-    "cookie_name": "auth",
+  "browser_cookie": {
+    "domain": ".perplexity.ai",
+    "cookie_name": "__Secure-next-auth.session-token",
     "source_browser": "chrome"
   }
 }
@@ -146,9 +150,11 @@ Two artifacts:
 Persists in `settings.json` like any other account config.
 
 **Cookie value** (in the credentials store — sensitive):
-- Existing credentials store gains a `kind` field: `"api_key"` (default) or `"browser_session"`.
-- For `browser_session`, the value is the cookie blob plus `expiry`, `last_extracted_at`, `source_browser`.
-- Storage encryption-at-rest stays as it is today (the credentials store already uses keychain on macOS / libsecret / DPAPI per `internal/credentials`). New entries use the same path.
+- Existing credentials store gains a `sessions` map alongside `keys`.
+- For each browser-session entry we persist the cookie value plus `expiry`,
+  `captured_at`, and `source_browser`.
+- Storage uses the same `credentials.json` file with `0600` permissions as API
+  keys today. New entries use the same path.
 
 ### 5.4 Provider integration pattern
 
@@ -260,15 +266,15 @@ Description: Thin wrapper over `github.com/browserutils/kooky`. Exposes `ReadCoo
 Tests: mock kooky-like backend, success / not-found / timeout / multi-browser preference order.
 
 ### Task 3: credentials store extension
-Files: `internal/credentials/store.go`, `internal/credentials/store_test.go`
+Files: `internal/config/credentials.go`, `internal/config/credentials_session_test.go`
 Depends on: Task 1
-Description: `kind` field on stored entries. `kind=browser_session` entries persist `value`, `expiry`, `last_extracted_at`, `source_browser`. Migration: existing entries default `kind=api_key`. Encryption-at-rest unchanged.
+Description: Extend the existing `credentials.json` store with a `sessions` map alongside `keys`. Browser-session entries persist `value`, `expiry`, `captured_at`, `last_extracted_at`, `source_browser`, `domain`, and `cookie_name`. Storage uses the same `0600` filesystem-permission posture as API keys.
 Tests: round-trip with new fields; legacy load.
 
 ### Task 4: TUI 5 KEYS extensions
-Files: `internal/tui/settings_modal_input.go`, `internal/tui/settings_modal_preferences.go`, `internal/tui/settings_modal_layout.go`, new `internal/tui/browser_session_picker.go`, tests
+Files: `internal/tui/settings_modal_input.go`, `internal/tui/settings_modal_preferences.go`, `internal/tui/provider_widget.go`, tests
 Depends on: Tasks 2, 3
-Description: For accounts with `SupplementalTypes` containing `browser_session`: a new sub-state for connect modal (the "y / r / esc" picker), a `connectBrowserSessionCmd` that calls into the extractor, status updates on the row.
+Description: Add a browser picker flow for primary browser-session providers and a `c` shortcut for mixed-auth providers that offer browser-session as supplemental auth. `connectBrowserSessionCmd` reads only from the chosen browser, account rows surface cookie connection state, and mixed-auth rows keep API-key editing as the primary `Enter` action.
 Tests: modal open / read action / cancel / extraction failure handling.
 
 ### Task 5: OpenCode provider integration

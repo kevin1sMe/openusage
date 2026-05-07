@@ -22,7 +22,7 @@ The default telemetry-to-account mapping table contains a single entry (`anthrop
 1. Adding Moonshot or Perplexity providers / env-var detection — issue #79, separate work, requires test accounts.
 2. Auto-creating synthetic provider tiles from telemetry. `docs/TELEMETRY_INTEGRATIONS.md` explicitly forbids that.
 3. Changing OpenCode plugin emission to use openusage's internal IDs. We map at read time, not ingestion time, to keep the plugin source-of-truth honest.
-4. Improving daemon environment-variable detection (e.g., the launchd-vs-shell case where `OPENROUTER_API_KEY` is set in the user's shell but not in the daemon's environment). This is a separate, larger problem.
+4. Fully dynamic daemon environment-variable detection. Install-time service env snapshots now cover the common launchd/systemd shell-vs-service gap, but live propagation of later shell env changes is still separate.
 5. Adding per-tile "unmapped" badges. The header pill + Settings tab is sufficient.
 
 ## 4. Impact Analysis

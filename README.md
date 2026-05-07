@@ -132,7 +132,7 @@ Tracks credits, activity, generation stats, and per-model breakdown across multi
 | **DeepSeek** | `DEEPSEEK_API_KEY` | Rate limits, account balance |
 | **Moonshot (Kimi)** | `MOONSHOT_API_KEY` | Balance breakdown (cash + voucher), org limits, tier; supports api.moonshot.ai (default) and api.moonshot.cn |
 | **Perplexity** | Browser session at console.perplexity.ai | Tier, balance, lifetime spend, auto-reload, 30d usage analytics |
-| **OpenCode (Zen + Console)** | `OPENCODE_API_KEY` + browser session at opencode.ai | Zen models (API key) + balance, monthly limit/usage, subscription, payment method (cookie) |
+| **OpenCode (Zen + Console)** | `OPENCODE_API_KEY` / `ZEN_API_KEY` + browser session at opencode.ai | Zen models (API key) + balance, monthly limit/usage, subscription, payment method (cookie) |
 | **xAI (Grok)** | `XAI_API_KEY` | Rate limits, API key info |
 | **Z.AI Coding Plan** | `ZAI_API_KEY` / `ZHIPUAI_API_KEY` | Coding plan quotas, model/tool usage, daily trends |
 | **Google Gemini API** | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Rate limits, model limits |
@@ -187,6 +187,10 @@ openusage telemetry daemon install        # Install as system service (launchd /
 openusage telemetry daemon status         # Check status
 openusage telemetry daemon uninstall      # Uninstall
 ```
+
+Installed services snapshot the provider env vars currently set in your shell.
+If you change API key env vars later, rerun `openusage telemetry daemon install`
+to refresh the service environment.
 
 Manage tool integrations:
 
