@@ -18,7 +18,7 @@ type Credentials struct {
 // by providers whose dashboard data is gated by session cookies — see
 // docs/BROWSER_SESSION_AUTH_DESIGN.md. The cookie value lives only in this
 // file (not in settings.json), and the file is written with 0o600 perms;
-// that's the same encryption-at-rest posture as the existing api-key store.
+// that's the same filesystem-permission posture as the existing API-key store.
 type BrowserSession struct {
 	// Domain and CookieName are mirrors of the AccountConfig.BrowserCookie
 	// reference, persisted here so the credential is self-contained
@@ -88,6 +88,19 @@ func LoadCredentialsFrom(path string) (Credentials, error) {
 		}
 		creds.Keys = normalized
 	}
+	if len(creds.Sessions) > 0 {
+		normalized := make(map[string]BrowserSession, len(creds.Sessions))
+		for accountID, session := range creds.Sessions {
+			id := normalizeAccountID(accountID)
+			if id == "" {
+				continue
+			}
+			if _, exists := normalized[id]; !exists || accountID == id {
+				normalized[id] = session
+			}
+		}
+		creds.Sessions = normalized
+	}
 
 	return creds, nil
 }
@@ -144,7 +157,7 @@ func DeleteCredentialFrom(path, accountID string) error {
 }
 
 // SaveSession persists a browser-session credential under the given account.
-// The credential is encrypted-at-rest only via filesystem perms (0o600) —
+// The credential is protected only via filesystem perms (0o600) — the
 // same posture as API keys in this store. Cookie values must never travel
 // outside this file or the runtime memory of the daemon.
 func SaveSession(accountID string, session BrowserSession) error {

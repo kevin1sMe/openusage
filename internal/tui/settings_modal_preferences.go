@@ -2,7 +2,7 @@ package tui
 
 import (
 	"fmt"
-	"os"
+	"runtime"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -81,7 +81,7 @@ func (m Model) apiKeysTabIDs() []string {
 	var ids []string
 	for _, id := range m.providerOrder {
 		providerID := m.accountProviders[id]
-		if isAPIKeyProvider(providerID) || isBrowserSessionProvider(providerID) {
+		if isAPIKeyProvider(providerID) || supportsBrowserSessionProvider(providerID) {
 			ids = append(ids, id)
 			registered[providerID] = true
 		}
@@ -129,22 +129,30 @@ func (m Model) renderSettingsAPIKeysBody(w, h int) string {
 		return m.renderBrowserPicker(w, h)
 	}
 	ids := m.apiKeysTabIDs()
-	configuredCount := 0
+	readyCount := 0
 	for _, id := range ids {
 		providerID := providerForAccountID(id, m.accountProviders)
-		if !isAPIKeyProvider(providerID) {
-			continue
-		}
-		if envVar := envVarForProvider(providerID); envVar != "" && os.Getenv(envVar) != "" {
-			configuredCount++
-			continue
-		}
-		if snap, ok := m.snapshots[id]; ok && snap.Status == core.StatusOK {
-			configuredCount++
+		switch {
+		case isBrowserSessionProvider(providerID):
+			if m.services == nil {
+				continue
+			}
+			info := m.services.LoadBrowserSessionInfo(id)
+			if info.Connected && !info.Expired {
+				readyCount++
+			}
+		case isAPIKeyProvider(providerID):
+			if hasConfiguredAPIKeyEnv(providerID) {
+				readyCount++
+				continue
+			}
+			if snap, ok := m.snapshots[id]; ok && snap.Status == core.StatusOK {
+				readyCount++
+			}
 		}
 	}
 
-	lines := settingsBodyHeaderLines("API Key Management", fmt.Sprintf("%d/%d configured (env or validated)", configuredCount, len(ids)))
+	lines := settingsBodyHeaderLines("Credential Management", fmt.Sprintf("%d/%d ready", readyCount, len(ids)))
 	accountW := 20
 	envW := max(10, w-accountW-18)
 	if accountW = max(10, w-envW-18); accountW < 10 {
@@ -185,13 +193,25 @@ func (m Model) renderSettingsAPIKeysBody(w, h int) string {
 			continue
 		}
 
-		envLabel := truncateToWidth(core.FirstNonEmpty(envVarForProvider(providerID), "-"), envW)
+		envLabel := core.FirstNonEmpty(apiKeyEnvLabelForProvider(providerID), "-")
 		statusText := "MISS"
 		if snap, ok := m.snapshots[id]; ok && snap.Status == core.StatusOK {
 			statusText = "OK"
-		} else if envVar := envVarForProvider(providerID); envVar != "" && os.Getenv(envVar) != "" {
+		} else if hasConfiguredAPIKeyEnv(providerID) {
 			statusText = "ENV"
 		}
+		if supportsBrowserSessionProvider(providerID) && m.services != nil {
+			info := m.services.LoadBrowserSessionInfo(id)
+			switch {
+			case info.Connected && info.Expired:
+				envLabel += " + stale"
+			case info.Connected && info.SourceBrowser != "":
+				envLabel += " + browser:" + info.SourceBrowser
+			case info.Connected:
+				envLabel += " + browser"
+			}
+		}
+		envLabel = truncateToWidth(envLabel, envW)
 		lines = append(lines, fmt.Sprintf("%s%-3d %-7s %-*s %-*s", prefix, i+1, statusText, accountW, truncateToWidth(id, accountW), envW, envLabel))
 		if m.settings.apiKeyEditing && i == cursor {
 			cursorChar := PulseChar("█", "▌", m.animFrame)
@@ -209,13 +229,13 @@ func (m Model) renderSettingsAPIKeysBody(w, h int) string {
 	// browser-session row is in view.
 	hasBrowserRows := false
 	for _, id := range ids {
-		if isBrowserSessionProvider(providerForAccountID(id, m.accountProviders)) {
+		if supportsBrowserSessionProvider(providerForAccountID(id, m.accountProviders)) {
 			hasBrowserRows = true
 			break
 		}
 	}
 	if hasBrowserRows {
-		lines = append(lines, "", dimStyle.Render("  Enter: read cookie · b: open site in browser · x: disconnect · d: delete API key (api-key rows only)"))
+		lines = append(lines, "", dimStyle.Render("  Enter: configure primary auth · c: read browser cookie · b: open site · x: disconnect browser session · d: delete API key"))
 	}
 	return padToSize(strings.Join(lines, "\n"), w, h)
 }
@@ -274,7 +294,10 @@ func (m Model) renderBrowserPicker(w, h int) string {
 		return padToSize(strings.Join(lines, "\n"), w, h)
 	}
 
-	hint := "macOS will prompt for the chosen browser's keychain item once on first read."
+	hint := "The chosen browser may prompt for keychain or secret-store access on first read."
+	if runtime.GOOS == "darwin" {
+		hint = "macOS may prompt for the chosen browser's keychain item on first read."
+	}
 	lines = append(lines, "", dimStyle.Render("  "+hint), "")
 
 	cursor := clamp(picker.cursor, 0, len(picker.browsers)-1)

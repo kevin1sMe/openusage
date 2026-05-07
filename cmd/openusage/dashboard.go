@@ -84,14 +84,27 @@ func runDashboard(cfg config.Config) {
 			if strings.TrimSpace(cfgNow.Accounts[i].Auth) == "" {
 				cfgNow.Accounts[i].Auth = authType
 			}
+			if strings.TrimSpace(cfgNow.Accounts[i].APIKeyEnv) == "" && strings.TrimSpace(acct.APIKeyEnv) != "" {
+				cfgNow.Accounts[i].APIKeyEnv = strings.TrimSpace(acct.APIKeyEnv)
+			}
+			if acct.BrowserCookie != nil {
+				cookie := *acct.BrowserCookie
+				cfgNow.Accounts[i].BrowserCookie = &cookie
+			}
 			break
 		}
 		if !found {
-			cfgNow.Accounts = append(cfgNow.Accounts, core.AccountConfig{
-				ID:       accountID,
-				Provider: providerID,
-				Auth:     authType,
-			})
+			newAccount := core.AccountConfig{
+				ID:        accountID,
+				Provider:  providerID,
+				Auth:      authType,
+				APIKeyEnv: strings.TrimSpace(acct.APIKeyEnv),
+			}
+			if acct.BrowserCookie != nil {
+				cookie := *acct.BrowserCookie
+				newAccount.BrowserCookie = &cookie
+			}
+			cfgNow.Accounts = append(cfgNow.Accounts, newAccount)
 		}
 
 		if err := config.Save(cfgNow); err != nil {

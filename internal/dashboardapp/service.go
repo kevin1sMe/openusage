@@ -158,10 +158,10 @@ func (s *Service) LoadBrowserSessionInfo(accountID string) core.BrowserSessionIn
 // Returns the captured source browser on success. Used by the TUI's
 // "Connect via browser" flow.
 //
-// preferredBrowser may be empty (first connect) or carry the persisted
-// SourceBrowser hint from previous extractions. The reader still scans every
-// browser; the hint just controls tie-breaking + reduces keychain prompts.
-func (s *Service) ConnectBrowserSession(accountID, domain, cookieName, preferredBrowser string) (core.BrowserSessionInfo, error) {
+// browser may be empty (auto-fallback to Firefox/Safari) or name a single
+// browser chosen by the user from the picker. Reads are scoped to that one
+// browser's stores so we never trigger a cascade of OS secret prompts.
+func (s *Service) ConnectBrowserSession(accountID, domain, cookieName, browser string) (core.BrowserSessionInfo, error) {
 	if strings.TrimSpace(accountID) == "" {
 		return core.BrowserSessionInfo{}, errors.New("account ID required")
 	}
@@ -172,10 +172,13 @@ func (s *Service) ConnectBrowserSession(accountID, domain, cookieName, preferred
 	ctx, cancel := context.WithTimeout(s.ctx, 15*time.Second)
 	defer cancel()
 
-	cookie, err := s.cookieReader.ReadCookie(ctx, domain, cookieName, preferredBrowser)
+	cookie, err := s.cookieReader.ReadCookie(ctx, domain, cookieName, browser)
 	if err != nil {
 		if errors.Is(err, browsercookies.ErrNoCookieFound) {
-			return core.BrowserSessionInfo{}, fmt.Errorf("no %s cookie found in any supported browser — log into the site and try again", cookieName)
+			if strings.TrimSpace(browser) != "" {
+				return core.BrowserSessionInfo{}, fmt.Errorf("no %s cookie found in %s — log into the site there and try again", cookieName, browser)
+			}
+			return core.BrowserSessionInfo{}, fmt.Errorf("no %s cookie found in a supported browser — log into the site and try again", cookieName)
 		}
 		return core.BrowserSessionInfo{}, fmt.Errorf("read cookie: %w", err)
 	}
@@ -219,8 +222,8 @@ func (s *Service) DisconnectBrowserSession(accountID string) error {
 }
 
 // OpenProviderConsole launches the provider's login/console URL in the user's
-// default browser. The "y" path of the connect modal — for users not currently
-// logged in.
+// default browser. Used when the user wants to log in before retrying the
+// browser-session import flow.
 func (s *Service) OpenProviderConsole(url string) error {
 	url = strings.TrimSpace(url)
 	if url == "" {

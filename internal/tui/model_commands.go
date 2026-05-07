@@ -214,8 +214,8 @@ func (m Model) disconnectBrowserSessionCmd(accountID string) tea.Cmd {
 }
 
 // openProviderConsoleCmd asks the OS to launch the provider's login URL in
-// the user's default browser. Used when the user picks "open browser" in
-// the connect modal because they're not currently logged in.
+// the user's default browser. Used when the user wants to log in before
+// retrying the browser-session import flow.
 func (m Model) openProviderConsoleCmd(url string) tea.Cmd {
 	return func() tea.Msg {
 		if m.services == nil {

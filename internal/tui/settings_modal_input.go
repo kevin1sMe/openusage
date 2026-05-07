@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/janekbaraniewski/openusage/internal/core"
@@ -239,43 +240,25 @@ func (m Model) handleSettingsModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.settings.cursor = clamp(m.settings.cursor, 0, len(ids)-1)
 			id := ids[m.settings.cursor]
 			providerID := providerForAccountID(id, m.accountProviders)
-			// Browser-session-auth providers route to the cookie-extraction
-			// flow instead of api-key editing. Enter triggers an immediate
-			// read attempt against any logged-in browser; on failure the
-			// status text guides the user to "press b to open the site".
 			if isBrowserSessionProvider(providerID) {
-				domain, cookieName, _ := browserCookieRefForProvider(providerID)
-				// Reconnect path: if we already remember which browser the
-				// user picked last time, scope the read to that browser
-				// directly. This is the "happy" path on subsequent reads —
-				// at most one keychain prompt, and only the one the user
-				// has already approved before.
-				if m.services != nil {
-					if info := m.services.LoadBrowserSessionInfo(id); info.Connected && info.SourceBrowser != "" {
-						m.settings.apiKeyStatus = fmt.Sprintf("re-reading cookie from %s...", info.SourceBrowser)
-						return m, m.connectBrowserSessionCmd(id, domain, cookieName, info.SourceBrowser)
-					}
-				}
-				// First-time connect: open the picker so the user explicitly
-				// chooses which browser openusage should look in. Without
-				// this step, kooky would scan every Chromium-family browser
-				// and the OS would prompt for each one's keychain item in
-				// sequence — the bug we're fixing here.
-				m.settings.browserPicker = browserPickerState{
-					active:     true,
-					accountID:  id,
-					domain:     domain,
-					cookieName: cookieName,
-					loading:    true,
-					status:     "looking for installed browsers...",
-				}
-				return m, m.loadAvailableBrowsersCmd(id)
+				return m.startBrowserSessionConnect(id, providerID)
 			}
 			m.settings.apiKeyEditing = true
 			m.settings.apiKeyEditAccountID = id
 			m.settings.apiKeyInput = ""
 			m.settings.apiKeyStatus = ""
 			return m, nil
+		case "c":
+			if len(ids) == 0 {
+				return m, nil
+			}
+			m.settings.cursor = clamp(m.settings.cursor, 0, len(ids)-1)
+			id := ids[m.settings.cursor]
+			providerID := providerForAccountID(id, m.accountProviders)
+			if !supportsBrowserSessionProvider(providerID) {
+				return m, nil
+			}
+			return m.startBrowserSessionConnect(id, providerID)
 		case "b":
 			// Open the provider's console URL in the user's default browser.
 			// Only meaningful for browser-session-auth providers — but
@@ -286,7 +269,7 @@ func (m Model) handleSettingsModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.settings.cursor = clamp(m.settings.cursor, 0, len(ids)-1)
 			id := ids[m.settings.cursor]
 			providerID := providerForAccountID(id, m.accountProviders)
-			if !isBrowserSessionProvider(providerID) {
+			if !supportsBrowserSessionProvider(providerID) {
 				return m, nil
 			}
 			_, _, consoleURL := browserCookieRefForProvider(providerID)
@@ -305,7 +288,7 @@ func (m Model) handleSettingsModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.settings.cursor = clamp(m.settings.cursor, 0, len(ids)-1)
 			id := ids[m.settings.cursor]
 			providerID := providerForAccountID(id, m.accountProviders)
-			if !isBrowserSessionProvider(providerID) {
+			if !supportsBrowserSessionProvider(providerID) {
 				return m, nil
 			}
 			m.settings.apiKeyStatus = "disconnecting..."
@@ -316,6 +299,10 @@ func (m Model) handleSettingsModalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.settings.cursor = clamp(m.settings.cursor, 0, len(ids)-1)
 			id := ids[m.settings.cursor]
+			providerID := providerForAccountID(id, m.accountProviders)
+			if !isAPIKeyProvider(providerID) {
+				return m, nil
+			}
 			m.settings.apiKeyStatus = "deleting..."
 			return m, m.deleteCredentialCmd(id)
 		}
@@ -584,6 +571,44 @@ func (m Model) clearProviderLinkAtCursor(rows []telemetryRow) (Model, tea.Cmd, b
 	source := details[idx].Source
 	m.settings.providerLinkPicker.status = "clearing user mapping for " + source + "..."
 	return m, m.deleteProviderLinkCmd(source), true
+}
+
+func (m Model) startBrowserSessionConnect(accountID, providerID string) (tea.Model, tea.Cmd) {
+	if !supportsBrowserSessionProvider(providerID) {
+		return m, nil
+	}
+	if !isBrowserSessionProvider(providerID) && !m.supplementalBrowserSessionReady(accountID, providerID) {
+		m.settings.apiKeyStatus = "configure the API key first, then connect browser session"
+		return m, nil
+	}
+
+	domain, cookieName, _ := browserCookieRefForProvider(providerID)
+	if m.services != nil {
+		if info := m.services.LoadBrowserSessionInfo(accountID); info.Connected && info.SourceBrowser != "" {
+			m.settings.apiKeyStatus = fmt.Sprintf("re-reading cookie from %s...", info.SourceBrowser)
+			return m, m.connectBrowserSessionCmd(accountID, domain, cookieName, info.SourceBrowser)
+		}
+	}
+
+	m.settings.browserPicker = browserPickerState{
+		active:     true,
+		accountID:  accountID,
+		domain:     domain,
+		cookieName: cookieName,
+		loading:    true,
+		status:     "looking for installed browsers...",
+	}
+	return m, m.loadAvailableBrowsersCmd(accountID)
+}
+
+func (m Model) supplementalBrowserSessionReady(accountID, providerID string) bool {
+	if isBrowserSessionProvider(providerID) {
+		return true
+	}
+	if strings.TrimSpace(m.accountProviders[accountID]) != "" {
+		return true
+	}
+	return hasConfiguredAPIKeyEnv(providerID)
 }
 
 // handleBrowserPickerKey routes input while the cookie-source browser

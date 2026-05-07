@@ -143,6 +143,25 @@ func TestLoadCredentials_LegacyFileMissingSessions(t *testing.T) {
 	}
 }
 
+func TestLoadCredentials_NormalizesSessionAccountIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	raw := `{"sessions":{"  perplexity  ":{"domain":".perplexity.ai","cookie_name":"__Secure-next-auth.session-token","value":"cookie"}}}`
+	if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session, ok, err := LoadSessionFrom(path, "perplexity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("normalized session not found")
+	}
+	if session.Value != "cookie" {
+		t.Fatalf("Value = %q, want cookie", session.Value)
+	}
+}
+
 // File serialization must omit the empty sessions map so legacy consumers
 // (or hand-edited files) don't see unfamiliar fields.
 func TestSaveCredentials_OmitsEmptySessions(t *testing.T) {

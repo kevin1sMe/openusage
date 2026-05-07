@@ -118,3 +118,63 @@ func TestNewModel_AppliesWidgetSectionOverridesFromConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestAPIKeyEnvLabelForProvider_IncludesAliases(t *testing.T) {
+	tests := []struct {
+		providerID string
+		want       string
+	}{
+		{providerID: "opencode", want: "OPENCODE_API_KEY / ZEN_API_KEY"},
+		{providerID: "gemini_api", want: "GEMINI_API_KEY / GOOGLE_API_KEY"},
+		{providerID: "zai", want: "ZAI_API_KEY / ZHIPUAI_API_KEY"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.providerID, func(t *testing.T) {
+			if got := apiKeyEnvLabelForProvider(tt.providerID); got != tt.want {
+				t.Fatalf("apiKeyEnvLabelForProvider(%q) = %q, want %q", tt.providerID, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolvedAPIKeyEnvForProvider_PrefersConfiguredAlias(t *testing.T) {
+	t.Setenv("OPENCODE_API_KEY", "")
+	t.Setenv("ZEN_API_KEY", "zen-test-key")
+	t.Setenv("GEMINI_API_KEY", "")
+	t.Setenv("GOOGLE_API_KEY", "google-test-key")
+	t.Setenv("ZAI_API_KEY", "")
+	t.Setenv("ZHIPUAI_API_KEY", "zhipu-test-key")
+
+	tests := []struct {
+		providerID string
+		want       string
+	}{
+		{providerID: "opencode", want: "ZEN_API_KEY"},
+		{providerID: "gemini_api", want: "GOOGLE_API_KEY"},
+		{providerID: "zai", want: "ZHIPUAI_API_KEY"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.providerID, func(t *testing.T) {
+			if got := resolvedAPIKeyEnvForProvider(tt.providerID); got != tt.want {
+				t.Fatalf("resolvedAPIKeyEnvForProvider(%q) = %q, want %q", tt.providerID, got, tt.want)
+			}
+			if !hasConfiguredAPIKeyEnv(tt.providerID) {
+				t.Fatalf("hasConfiguredAPIKeyEnv(%q) = false, want true", tt.providerID)
+			}
+		})
+	}
+}
+
+func TestResolvedAPIKeyEnvForProvider_FallsBackToPrimary(t *testing.T) {
+	t.Setenv("OPENCODE_API_KEY", "")
+	t.Setenv("ZEN_API_KEY", "")
+
+	if got := resolvedAPIKeyEnvForProvider("opencode"); got != "OPENCODE_API_KEY" {
+		t.Fatalf("resolvedAPIKeyEnvForProvider(opencode) = %q, want OPENCODE_API_KEY", got)
+	}
+	if hasConfiguredAPIKeyEnv("opencode") {
+		t.Fatal("hasConfiguredAPIKeyEnv(opencode) = true, want false")
+	}
+}

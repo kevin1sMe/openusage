@@ -22,7 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/providers/providerbase"
 	"github.com/janekbaraniewski/openusage/internal/providers/shared"
@@ -74,7 +73,7 @@ func New() *Provider {
 func (p *Provider) Fetch(ctx context.Context, acct core.AccountConfig) (core.UsageSnapshot, error) {
 	snap := core.NewUsageSnapshot(p.ID(), acct.ID)
 
-	session, ok, err := config.LoadSession(acct.ID)
+	session, ok, err := shared.LoadOrRefreshBrowserSession(ctx, acct, nil)
 	if err != nil || !ok || session.Value == "" {
 		snap.Status = core.StatusAuth
 		snap.Message = "browser session not configured — Settings → 5 KEYS → perplexity → Enter"

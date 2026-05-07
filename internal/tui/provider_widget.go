@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"os"
 	"strings"
 	"sync"
 
@@ -52,7 +53,12 @@ func dashboardWidget(providerID string) core.DashboardWidget {
 type apiKeyProviderEntry struct {
 	ProviderID string
 	AccountID  string
-	EnvVar     string
+}
+
+var apiKeyEnvAliases = map[string][]string{
+	"opencode":   {"ZEN_API_KEY"},
+	"gemini_api": {"GOOGLE_API_KEY"},
+	"zai":        {"ZHIPUAI_API_KEY"},
 }
 
 func apiKeyProviderEntries() []apiKeyProviderEntry {
@@ -75,7 +81,6 @@ func apiKeyProviderEntries() []apiKeyProviderEntry {
 		entries = append(entries, apiKeyProviderEntry{
 			ProviderID: id,
 			AccountID:  accountID,
-			EnvVar:     envVar,
 		})
 	}
 	return entries
@@ -91,16 +96,53 @@ func isAPIKeyProvider(providerID string) bool {
 }
 
 func envVarForProvider(providerID string) string {
-	loadProviderSpecs()
-	spec, ok := providerSpecs[providerID]
-	if !ok {
+	envVars := apiKeyEnvVarsForProvider(providerID)
+	if len(envVars) == 0 {
 		return ""
 	}
-	return spec.Auth.APIKeyEnv
+	return envVars[0]
+}
+
+func apiKeyEnvVarsForProvider(providerID string) []string {
+	loadProviderSpecs()
+	spec, ok := providerSpecs[providerID]
+	if !ok || spec.Auth.Type != core.ProviderAuthTypeAPIKey || spec.Auth.APIKeyEnv == "" {
+		return nil
+	}
+
+	envVars := []string{spec.Auth.APIKeyEnv}
+	envVars = append(envVars, apiKeyEnvAliases[providerID]...)
+	return dedupeNonEmptyStrings(envVars)
+}
+
+func apiKeyEnvLabelForProvider(providerID string) string {
+	envVars := apiKeyEnvVarsForProvider(providerID)
+	if len(envVars) == 0 {
+		return ""
+	}
+	return strings.Join(envVars, " / ")
+}
+
+func resolvedAPIKeyEnvForProvider(providerID string) string {
+	for _, envVar := range apiKeyEnvVarsForProvider(providerID) {
+		if strings.TrimSpace(os.Getenv(envVar)) != "" {
+			return envVar
+		}
+	}
+	return envVarForProvider(providerID)
+}
+
+func hasConfiguredAPIKeyEnv(providerID string) bool {
+	for _, envVar := range apiKeyEnvVarsForProvider(providerID) {
+		if strings.TrimSpace(os.Getenv(envVar)) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // browserSessionProviderEntry is the analogue of apiKeyProviderEntry for
-// providers that authenticate via browser-session cookies. Used by the
+// providers whose PRIMARY auth path is a browser-session cookie. Used by the
 // 5 KEYS tab to seed rows for declared providers even when the user has
 // no account configured yet.
 type browserSessionProviderEntry struct {
@@ -117,7 +159,7 @@ func browserSessionProviderEntries() []browserSessionProviderEntry {
 	var entries []browserSessionProviderEntry
 	for _, id := range providerOrder {
 		spec := providerSpecs[id]
-		if !spec.Auth.SupportsAuth(core.ProviderAuthTypeBrowserSession) {
+		if spec.Auth.Type != core.ProviderAuthTypeBrowserSession {
 			continue
 		}
 		if spec.Auth.BrowserCookieDomain == "" || spec.Auth.BrowserCookieName == "" {
@@ -144,11 +186,23 @@ func browserSessionProviderEntries() []browserSessionProviderEntry {
 	return entries
 }
 
-// isBrowserSessionProvider reports whether the given provider supports
-// browser-session auth as a primary or supplemental credential path. Used
-// by the 5 KEYS tab to decide whether to render the "Connect via browser"
-// row + handle the connect modal flow.
+// isBrowserSessionProvider reports whether the provider's PRIMARY auth path
+// is a browser-session cookie. These providers can be configured from the
+// 5 KEYS tab even when no account exists yet (for example Perplexity).
 func isBrowserSessionProvider(providerID string) bool {
+	loadProviderSpecs()
+	spec, ok := providerSpecs[providerID]
+	if !ok {
+		return false
+	}
+	return spec.Auth.Type == core.ProviderAuthTypeBrowserSession
+}
+
+// supportsBrowserSessionProvider reports whether the provider supports a
+// browser-session cookie as either its primary or a supplemental auth path.
+// Used for mixed-auth rows like OpenCode where API-key config remains the
+// primary path but console enrichment is available via browser session.
+func supportsBrowserSessionProvider(providerID string) bool {
 	loadProviderSpecs()
 	spec, ok := providerSpecs[providerID]
 	if !ok {
@@ -172,6 +226,20 @@ func browserCookieRefForProvider(providerID string) (domain, cookieName, console
 		consoleURL = "https://" + strings.TrimPrefix(spec.Auth.BrowserCookieDomain, ".")
 	}
 	return spec.Auth.BrowserCookieDomain, spec.Auth.BrowserCookieName, consoleURL
+}
+
+func dedupeNonEmptyStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	var deduped []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		deduped = append(deduped, value)
+	}
+	return deduped
 }
 
 func setDashboardWidgetSectionOverrides(sections []core.DashboardStandardSection) {

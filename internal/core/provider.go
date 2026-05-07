@@ -17,7 +17,7 @@ type AccountConfig struct {
 	// BrowserCookie identifies the (domain, cookie_name, source_browser)
 	// triple used for browser-session-auth providers. Persisted alongside
 	// the account config. The actual cookie value is never stored here —
-	// it lives in the encrypted credentials store, keyed by account ID.
+	// it lives in the 0o600 credentials store, keyed by account ID.
 	// See docs/BROWSER_SESSION_AUTH_DESIGN.md.
 	BrowserCookie *BrowserCookieRef `json:"browser_cookie,omitempty"`
 

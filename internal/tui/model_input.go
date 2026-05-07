@@ -150,6 +150,37 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.settings.status = "browser session connect failed for " + msg.AccountID
 			return m, nil
 		}
+		m.ensureProviderTracking()
+		providerID := providerForAccountID(msg.AccountID, m.accountProviders)
+		if providerID != "" {
+			authType := "browser_session"
+			acct := core.AccountConfig{
+				ID:       msg.AccountID,
+				Provider: providerID,
+				BrowserCookie: &core.BrowserCookieRef{
+					Domain:        msg.Info.Domain,
+					CookieName:    msg.Info.CookieName,
+					SourceBrowser: msg.Info.SourceBrowser,
+				},
+			}
+			if domain, cookieName, _ := browserCookieRefForProvider(providerID); domain != "" || cookieName != "" {
+				acct.BrowserCookie.Domain = core.FirstNonEmpty(domain, acct.BrowserCookie.Domain)
+				acct.BrowserCookie.CookieName = core.FirstNonEmpty(cookieName, acct.BrowserCookie.CookieName)
+			}
+			if isAPIKeyProvider(providerID) {
+				authType = "api_key"
+				acct.APIKeyEnv = resolvedAPIKeyEnvForProvider(providerID)
+			}
+			acct.Auth = authType
+			if m.onAddAccount != nil {
+				m.onAddAccount(acct)
+			}
+			m.accountProviders[msg.AccountID] = providerID
+			if m.providerOrderIndex(msg.AccountID) < 0 {
+				m.providerOrder = append(m.providerOrder, msg.AccountID)
+				m.providerEnabled[msg.AccountID] = true
+			}
+		}
 		m.settings.apiKeyStatus = fmt.Sprintf("connected via %s", msg.Info.SourceBrowser)
 		m.settings.status = fmt.Sprintf("browser session connected for %s", msg.AccountID)
 		// Trigger a fresh poll so the tile picks up the new auth path.
@@ -290,6 +321,7 @@ func (m Model) handleCredentialSavedMsg(msg credentialSavedMsg) (tea.Model, tea.
 	if msg.Err != nil {
 		m.settings.apiKeyStatus = "save failed"
 	} else {
+		m.ensureProviderTracking()
 		m.settings.apiKeyStatus = "saved ✓"
 		apiKey := m.settings.apiKeyInput
 		m.settings.apiKeyEditing = false

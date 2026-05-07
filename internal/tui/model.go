@@ -280,7 +280,17 @@ func (m *Model) SetServices(services Services) {
 	m.services = services
 }
 
-// SetOnAddAccount sets a callback invoked when a new provider account is added via the API Keys tab.
+func (m *Model) ensureProviderTracking() {
+	if m.providerEnabled == nil {
+		m.providerEnabled = make(map[string]bool)
+	}
+	if m.accountProviders == nil {
+		m.accountProviders = make(map[string]string)
+	}
+}
+
+// SetOnAddAccount sets a callback invoked when the credentials UI creates or
+// updates a provider account (API key save or browser-session connect).
 func (m *Model) SetOnAddAccount(fn func(core.AccountConfig)) {
 	m.onAddAccount = fn
 }
