@@ -45,6 +45,7 @@ func main() {
 	root.AddCommand(newTelemetryCommand())
 	root.AddCommand(newIntegrationsCommand())
 	root.AddCommand(newDetectCommand())
+	root.AddCommand(newHubCommand())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
