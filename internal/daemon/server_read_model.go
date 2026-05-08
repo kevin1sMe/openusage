@@ -91,6 +91,24 @@ func (s *Service) runReadModelCacheLoop(ctx context.Context) {
 	}
 }
 
+// currentSnapshots returns the latest snapshots from the read-model cache,
+// or computes them on the fly if the cache is empty.
+func (s *Service) currentSnapshots(ctx context.Context) map[string]core.UsageSnapshot {
+	// try cache first
+	if snaps := s.rmCache.all(); len(snaps) > 0 {
+		return snaps
+	}
+	req, err := BuildReadModelRequestFromConfig()
+	if err != nil {
+		return map[string]core.UsageSnapshot{}
+	}
+	snaps, err := s.computeReadModel(ctx, req)
+	if err != nil {
+		return map[string]core.UsageSnapshot{}
+	}
+	return snaps
+}
+
 func (s *Service) refreshReadModelCacheFromConfig(ctx context.Context) {
 	req, err := BuildReadModelRequestFromConfig()
 	if err != nil {

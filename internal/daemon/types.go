@@ -127,6 +127,19 @@ func (c *readModelCache) set(cacheKey string, snapshots map[string]core.UsageSna
 	c.mu.Unlock()
 }
 
+// all returns a merged map of all cached snapshots across all keys.
+func (c *readModelCache) all() map[string]core.UsageSnapshot {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]core.UsageSnapshot, len(c.entries))
+	for _, entry := range c.entries {
+		for k, v := range entry.snapshots {
+			out[k] = v
+		}
+	}
+	return out
+}
+
 func (c *readModelCache) beginRefresh(cacheKey string) bool {
 	if cacheKey == "" {
 		return false
