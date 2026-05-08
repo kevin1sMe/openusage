@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/janekbaraniewski/openusage/internal/config"
+	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/telemetry"
 )
 
@@ -16,7 +17,6 @@ func (s *Service) runCollectLoop(ctx context.Context) {
 
 	s.infof("collect_loop_start", "interval=%s", interval)
 	s.collectAndFlush(ctx)
-	s.pushToExporter(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -24,7 +24,6 @@ func (s *Service) runCollectLoop(ctx context.Context) {
 			return
 		case <-time.After(interval):
 			collected := s.collectAndFlush(ctx)
-			s.pushToExporter(ctx)
 			if collected == 0 {
 				consecutiveEmpty++
 				if consecutiveEmpty >= 3 {
@@ -48,12 +47,8 @@ func (s *Service) runCollectLoop(ctx context.Context) {
 	}
 }
 
-func (s *Service) pushToExporter(ctx context.Context) {
-	if s.exp == nil {
-		return
-	}
-	snaps := s.currentSnapshots(ctx)
-	if len(snaps) == 0 {
+func (s *Service) pushToExporter(_ context.Context, snaps map[string]core.UsageSnapshot) {
+	if s.exp == nil || len(snaps) == 0 {
 		return
 	}
 	s.exp.Ingest(snaps)

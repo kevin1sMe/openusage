@@ -17,7 +17,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/exporter"
 	"github.com/janekbaraniewski/openusage/internal/providers"
@@ -104,16 +103,9 @@ func startService(ctx context.Context, cfg Config) (*Service, error) {
 		log.Printf("[daemon] warning: migrations failed: %v", err)
 	}
 
-	// init exporter if export target is configured
 	var exp *exporter.Exporter
-	fileCfg, err := config.Load()
-	if err != nil {
-		log.Printf("exporter: failed to load config: %v", err)
-		fileCfg = config.DefaultConfig()
-	}
-	expCfg := fileCfg.Export
-	if expCfg.Target != "" {
-		if e, err := exporter.New(expCfg); err != nil {
+	if cfg.Export.Target != "" {
+		if e, err := exporter.New(cfg.Export); err != nil {
 			log.Printf("exporter: init failed: %v", err)
 		} else {
 			exp = e
