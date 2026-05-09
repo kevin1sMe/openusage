@@ -20,16 +20,27 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// envHubToken is shared with the hub server + exporter: if --token is not
+// provided, this env var is used as a Bearer token fallback.
+const envHubToken = "OPENUSAGE_HUB_TOKEN"
+
 func newHubViewCommand() *cobra.Command {
 	var interval time.Duration
+	var token string
 
 	cmd := &cobra.Command{
 		Use:   "hub-view <url>",
 		Short: "View a remote hub's aggregated usage data in the TUI",
-		Long:  "Connect to a remote OpenUsage hub and display its aggregated snapshot data in a read-only TUI. No local providers or daemon required.",
+		Long: strings.Join([]string{
+			"Connect to a remote OpenUsage hub and display its aggregated snapshot data in a read-only TUI.",
+			"No local providers or daemon required.",
+			"",
+			"If the target hub has auth_token set, pass --token or export OPENUSAGE_HUB_TOKEN to authenticate.",
+		}, "\n"),
 		Example: strings.Join([]string{
 			"  openusage hub-view https://openusage.gameapp.club",
 			"  openusage hub-view http://192.168.1.10:9190 --interval 10s",
+			"  OPENUSAGE_HUB_TOKEN=s3cret openusage hub-view http://hub:9190",
 		}, "\n"),
 		Args: cobra.ExactArgs(1),
 		Run: func(_ *cobra.Command, args []string) {
@@ -42,15 +53,20 @@ func newHubViewCommand() *cobra.Command {
 			if interval > 0 {
 				cfg.UI.RefreshIntervalSeconds = int(interval.Seconds())
 			}
-			runHubView(cfg, hubURL)
+			resolved := strings.TrimSpace(token)
+			if resolved == "" {
+				resolved = strings.TrimSpace(os.Getenv(envHubToken))
+			}
+			runHubView(cfg, hubURL, resolved)
 		},
 	}
 
 	cmd.Flags().DurationVar(&interval, "interval", 0, "polling interval for fetching snapshots (0 uses config or 30s)")
+	cmd.Flags().StringVar(&token, "token", "", "Bearer token for hubs requiring auth (falls back to OPENUSAGE_HUB_TOKEN env var)")
 	return cmd
 }
 
-func runHubView(cfg config.Config, hubURL string) {
+func runHubView(cfg config.Config, hubURL, token string) {
 	verbose := os.Getenv("OPENUSAGE_DEBUG") != ""
 
 	if err := tui.LoadThemes(config.ConfigDir()); err != nil && verbose {
@@ -82,19 +98,38 @@ func runHubView(cfg config.Config, hubURL string) {
 	defer cancel()
 
 	go func() {
+		// Optimistically mark the hub as "running" on launch so the splash
+		// screen doesn't block the TUI — the first fetch will update the
+		// status to Error if the hub is unreachable.
 		program.Send(tui.DaemonStatusMsg{Status: tui.DaemonRunning})
 
 		snapshotsURL := hubURL + "/v1/snapshots"
 		client := &http.Client{Timeout: 10 * time.Second}
 
+		// lastStatus avoids flooding the TUI with redundant status messages
+		// when nothing has changed between polls.
+		var lastStatus tui.DaemonStatus
+		var lastMessage string
+
+		sendStatus := func(status tui.DaemonStatus, message string) {
+			if status == lastStatus && message == lastMessage {
+				return
+			}
+			lastStatus = status
+			lastMessage = message
+			program.Send(tui.DaemonStatusMsg{Status: status, Message: message})
+		}
+
 		fetch := func() {
-			snaps, err := fetchHubSnapshots(client, snapshotsURL)
+			snaps, err := fetchHubSnapshots(client, snapshotsURL, token)
 			if err != nil {
 				if verbose {
 					log.Printf("hub-view: fetch %s: %v", snapshotsURL, err)
 				}
+				sendStatus(tui.DaemonError, fmt.Sprintf("hub fetch failed: %v", err))
 				return
 			}
+			sendStatus(tui.DaemonRunning, fmt.Sprintf("hub %s · %d machine snapshots", hubURL, len(snaps)))
 			if len(snaps) == 0 {
 				return
 			}
@@ -128,13 +163,23 @@ func runHubView(cfg config.Config, hubURL string) {
 	}
 }
 
-func fetchHubSnapshots(client *http.Client, url string) (map[string]core.UsageSnapshot, error) {
-	resp, err := client.Get(url)
+func fetchHubSnapshots(client *http.Client, url, token string) (map[string]core.UsageSnapshot, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("HTTP 401: hub requires Bearer token (--token or OPENUSAGE_HUB_TOKEN)")
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
