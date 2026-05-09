@@ -46,6 +46,7 @@ func main() {
 	root.AddCommand(newIntegrationsCommand())
 	root.AddCommand(newDetectCommand())
 	root.AddCommand(newHubCommand())
+	root.AddCommand(newHubViewCommand())
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
