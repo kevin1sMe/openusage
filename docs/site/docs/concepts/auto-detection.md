@@ -23,6 +23,7 @@ For each supported provider, the detector checks whether a known env var is set 
 | `DEEPSEEK_API_KEY` | deepseek |
 | `XAI_API_KEY` | xai |
 | `GEMINI_API_KEY` | gemini_api |
+| `GOOGLE_API_KEY` | gemini_api (account id `gemini-google`) |
 | `ALIBABA_CLOUD_API_KEY` | alibaba_cloud |
 | `MOONSHOT_API_KEY` | moonshot |
 | `ZAI_API_KEY` / `ZHIPUAI_API_KEY` | zai |
@@ -36,7 +37,7 @@ For coding agents, the detector looks for the CLI binary on `$PATH` plus a confi
 
 | Tool | Signals |
 |---|---|
-| Claude Code | `claude` binary + `~/.claude/` (or `~/.config/claude/` on Linux) |
+| Claude Code | `claude` binary + `~/.claude/` |
 | Codex CLI | `~/.codex/` directory |
 | Cursor IDE | App Support directory (`~/Library/Application Support/Cursor`, `~/.config/Cursor`, or `%APPDATA%\Cursor`) |
 | GitHub Copilot | `gh` CLI with Copilot extension, or standalone `copilot` binary + `~/.copilot/` |

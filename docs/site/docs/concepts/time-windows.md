@@ -41,10 +41,7 @@ This means a `1d` window can still show a `LIMIT` badge even if the limit only f
 
 ## Interaction with retention
 
-The window can never reach further back than the data the runtime has actually seen.
-
-- **Direct mode.** History only goes back to when the TUI launched. If you start the dashboard at 14:00 and pick `7d`, you get four hours of data, not seven days.
-- **Daemon mode.** History goes back to the oldest event in the SQLite store, capped by `data.retention_days` (default 30).
+The window can never reach further back than the data the daemon has actually stored. History goes back to the oldest event in the SQLite store, capped by `data.retention_days` (default 30).
 
 Set `30d` against a 7-day-old daemon install and you'll only see seven days of data. Querying further back than retention is silently truncated; OpenUsage does not warn.
 
@@ -52,11 +49,11 @@ If you need longer-term data, raise `data.retention_days` in `settings.json` **b
 
 ```json
 {
-  "data": { "retention_days": 90 }
+  "data": { "retention_days": 60 }
 }
 ```
 
-Lowering it later prunes older events at the next pass.
+`retention_days` is hard-capped at **90** — values above 90 are silently clamped at startup. Lowering the value later prunes older events at the next pass.
 
 ## Calendar 1d vs rolling 3d
 

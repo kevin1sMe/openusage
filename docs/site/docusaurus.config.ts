@@ -35,6 +35,13 @@ const config: Config = {
     locales: ['en'],
   },
 
+  clientModules: [require.resolve('./src/clientModules/posthog.ts')],
+
+  customFields: {
+    posthogKey: process.env.POSTHOG_KEY ?? '',
+    posthogHost: process.env.POSTHOG_HOST ?? '',
+  },
+
   themes: [
     '@docusaurus/theme-mermaid',
     [
@@ -96,6 +103,8 @@ const config: Config = {
       logo: {
         alt: 'OpenUsage logo',
         src: 'img/logo.svg',
+        href: 'https://openusage.sh/',
+        target: '_self',
       },
       items: [
         {
@@ -115,17 +124,12 @@ const config: Config = {
           position: 'left',
         },
         {
-          href: 'https://openusage.sh/',
-          label: 'Home',
-          position: 'right',
-        },
-        {
           href: 'https://github.com/janekbaraniewski/openusage',
           label: 'GitHub',
           position: 'right',
         },
         {
-          to: '/llms.txt',
+          href: 'pathname:///llms.txt',
           label: 'For AI',
           position: 'right',
           target: '_blank',
@@ -157,11 +161,11 @@ const config: Config = {
           title: 'More',
           items: [
             {label: 'Capability matrix', href: 'https://openusage.sh/docs/capability-matrix/'},
-            {label: 'OpenUsage.sh vs OpenUsage.ai', href: 'https://openusage.sh/docs/openusage-sh-vs-openusage-ai/'},
+            {label: 'For AI agents (llms.txt)', href: 'pathname:///llms.txt'},
           ],
         },
       ],
-      copyright: `OpenUsage is MIT licensed. © ${new Date().getFullYear()} Jan Baraniewski.`,
+      copyright: `OpenUsage is MIT licensed. © ${new Date().getFullYear()} <a href="https://baraniewski.com" target="_blank" rel="noopener">baraniewski.com</a>.`,
     },
     prism: {
       theme: prismThemes.oneLight,

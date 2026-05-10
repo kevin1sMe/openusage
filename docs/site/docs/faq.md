@@ -16,7 +16,7 @@ The component called the "telemetry daemon" is named for event-sourced **collect
 In two places, both on your machine:
 
 - `~/.config/openusage/settings.json` — configuration (no secrets, just env-var **names**).
-- `~/.local/state/openusage/telemetry.db` — SQLite store, only present in daemon mode.
+- `~/.local/state/openusage/telemetry.db` — SQLite store written by the daemon.
 
 Logs go to `~/.local/state/openusage/daemon.{stdout,stderr}.log`.
 
@@ -53,7 +53,7 @@ Yes. Pre-built Windows binaries are released; settings live at `%APPDATA%\openus
 The daemon's service install (launchd / systemd) is Unix-only. On Windows, run the daemon manually as needed:
 
 ```
-openusage telemetry daemon
+openusage telemetry daemon run
 ```
 
 ### Can I run it on Linux?

@@ -9,7 +9,7 @@ OpenUsage loads custom themes from JSON files alongside the bundled set. Drop a 
 
 ## File schema
 
-Every theme file is a single JSON object with **24 color fields plus a name and icon**. All fields are required — invalid or incomplete files are silently skipped at load time.
+Every theme file is a single JSON object with **24 color fields, a name, and an optional icon**. All 24 color fields and `name` are required; `icon` is optional. Invalid or incomplete files are silently skipped at load time.
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -62,9 +62,9 @@ export OPENUSAGE_THEME_DIR=~/dotfiles/openusage-themes:~/work/themes
 
 Source examples in the repo:
 
-- [`configs/themes/grayscale.json`](https://github.com/loft-sh/openusage/blob/main/configs/themes/grayscale.json)
-- [`configs/themes/tokyo-night.json`](https://github.com/loft-sh/openusage/blob/main/configs/themes/tokyo-night.json)
-- [`configs/themes/dracula.json`](https://github.com/loft-sh/openusage/blob/main/configs/themes/dracula.json)
+- [`configs/themes/grayscale.json`](https://github.com/janekbaraniewski/openusage/blob/main/configs/themes/grayscale.json)
+- [`configs/themes/tokyo-night.json`](https://github.com/janekbaraniewski/openusage/blob/main/configs/themes/tokyo-night.json)
+- [`configs/themes/dracula.json`](https://github.com/janekbaraniewski/openusage/blob/main/configs/themes/dracula.json)
 
 ## Complete example
 
