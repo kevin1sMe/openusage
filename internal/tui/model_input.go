@@ -9,6 +9,19 @@ import (
 	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
+// applyPersisted is the shared handler for the seven simple "save settings"
+// persisted-message types. Each msg type carries only an err; the only
+// thing that varies is the status label. Set m.settings.status to either
+// failureLabel or successLabel and return the updated model.
+func (m Model) applyPersisted(err error, failureLabel, successLabel string) Model {
+	if err != nil {
+		m.settings.status = failureLabel
+	} else {
+		m.settings.status = successLabel
+	}
+	return m
+}
+
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
@@ -41,60 +54,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleSnapshotsMsg(msg)
 
 	case dashboardPrefsPersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "save failed"
-		} else {
-			m.settings.status = "saved"
-		}
-		return m, nil
-
+		return m.applyPersisted(msg.err, "save failed", "saved"), nil
 	case dashboardViewPersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "view save failed"
-		} else {
-			m.settings.status = "view saved"
-		}
-		return m, nil
-
+		return m.applyPersisted(msg.err, "view save failed", "view saved"), nil
 	case dashboardWidgetSectionsPersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "section save failed"
-		} else {
-			m.settings.status = "sections saved"
-		}
-		return m, nil
-
+		return m.applyPersisted(msg.err, "section save failed", "sections saved"), nil
 	case detailWidgetSectionsPersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "detail section save failed"
-		} else {
-			m.settings.status = "detail sections saved"
-		}
-		return m, nil
-
+		return m.applyPersisted(msg.err, "detail section save failed", "detail sections saved"), nil
 	case dashboardHideSectionsWithNoDataPersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "empty-state save failed"
-		} else {
-			m.settings.status = "empty-state saved"
-		}
-		return m, nil
-
+		return m.applyPersisted(msg.err, "empty-state save failed", "empty-state saved"), nil
 	case themePersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "theme save failed"
-		} else {
-			m.settings.status = "theme saved"
-		}
-		return m, nil
-
+		return m.applyPersisted(msg.err, "theme save failed", "theme saved"), nil
 	case timeWindowPersistedMsg:
-		if msg.err != nil {
-			m.settings.status = "time window save failed"
-		} else {
-			m.settings.status = "time window saved"
-		}
-		return m, nil
+		return m.applyPersisted(msg.err, "time window save failed", "time window saved"), nil
 
 	case providerLinkPersistedMsg:
 		if msg.err != nil {

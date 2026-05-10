@@ -220,6 +220,11 @@ type Model struct {
 	tickRunning     bool      // true while the tick chain is active
 	lastInteraction time.Time // last user keypress/mouse event
 	lastDataUpdate  time.Time // last SnapshotsMsg with new data
+	// referenceTime is the wall-clock View() will use for "X ago" labels.
+	// Set once at the top of each View() / renderDashboard() so the same
+	// frame uses a single consistent timestamp (fixes test flakiness, gives
+	// future render-cache work a stable cache key, and keeps View() pure).
+	referenceTime time.Time
 
 	experimentalAnalytics bool // when false, only the Dashboard screen is available
 
@@ -580,30 +585,36 @@ func (m *Model) setWidgetSections(entries []config.DashboardWidgetSection) {
 	m.invalidateTileBodyCache()
 }
 
-func normalizeWidgetSectionEntries(entries []config.DashboardWidgetSection) []config.DashboardWidgetSection {
-	if len(entries) == 0 {
-		return nil
-	}
-
-	out := make([]config.DashboardWidgetSection, 0, len(entries))
-	seen := make(map[core.DashboardStandardSection]bool, len(entries))
-	for _, entry := range entries {
-		sectionID := core.DashboardStandardSection(strings.ToLower(strings.TrimSpace(string(entry.ID))))
-		sectionID = core.NormalizeDashboardStandardSection(sectionID)
-		if sectionID == core.DashboardSectionHeader || !core.IsKnownDashboardStandardSection(sectionID) || seen[sectionID] {
-			continue
+// dashboardSectionTrait describes how dashboard widget sections normalise
+// and order. The header section is intentionally excluded — it's not a
+// user-toggleable widget.
+var dashboardSectionTrait = sectionTrait[core.DashboardStandardSection, config.DashboardWidgetSection]{
+	extractID:      func(s config.DashboardWidgetSection) core.DashboardStandardSection { return s.ID },
+	extractEnabled: func(s config.DashboardWidgetSection) bool { return s.Enabled },
+	build: func(id core.DashboardStandardSection, enabled bool) config.DashboardWidgetSection {
+		return config.DashboardWidgetSection{ID: id, Enabled: enabled}
+	},
+	normalizeID: func(id core.DashboardStandardSection) core.DashboardStandardSection {
+		return core.NormalizeDashboardStandardSection(
+			core.DashboardStandardSection(strings.ToLower(strings.TrimSpace(string(id)))))
+	},
+	keepID: func(id core.DashboardStandardSection) bool {
+		return id != core.DashboardSectionHeader && core.IsKnownDashboardStandardSection(id)
+	},
+	defaultIDs: func() []core.DashboardStandardSection {
+		ordered := core.DashboardStandardSections()
+		out := make([]core.DashboardStandardSection, 0, len(ordered))
+		for _, section := range ordered {
+			if section != core.DashboardSectionHeader {
+				out = append(out, section)
+			}
 		}
-		out = append(out, config.DashboardWidgetSection{
-			ID:      sectionID,
-			Enabled: entry.Enabled,
-		})
-		seen[sectionID] = true
-	}
+		return out
+	},
+}
 
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+func normalizeWidgetSectionEntries(entries []config.DashboardWidgetSection) []config.DashboardWidgetSection {
+	return normalizeSections(entries, dashboardSectionTrait)
 }
 
 func (m *Model) applyWidgetSectionOverrides() {
@@ -623,22 +634,7 @@ func (m *Model) applyWidgetSectionOverrides() {
 }
 
 func (m Model) defaultWidgetSectionEntries() []config.DashboardWidgetSection {
-	ordered := make([]core.DashboardStandardSection, 0, len(core.DashboardStandardSections()))
-	for _, section := range core.DashboardStandardSections() {
-		if section == core.DashboardSectionHeader {
-			continue
-		}
-		ordered = append(ordered, section)
-	}
-
-	entries := make([]config.DashboardWidgetSection, 0, len(ordered))
-	for _, section := range ordered {
-		entries = append(entries, config.DashboardWidgetSection{
-			ID:      section,
-			Enabled: true,
-		})
-	}
-	return entries
+	return defaultSections(dashboardSectionTrait)
 }
 
 func (m Model) widgetSectionEntries() []config.DashboardWidgetSection {
@@ -646,25 +642,7 @@ func (m Model) widgetSectionEntries() []config.DashboardWidgetSection {
 }
 
 func (m Model) resolvedWidgetSectionEntries() []config.DashboardWidgetSection {
-	if len(m.widgetSections) == 0 {
-		return m.defaultWidgetSectionEntries()
-	}
-
-	out := make([]config.DashboardWidgetSection, len(m.widgetSections))
-	copy(out, m.widgetSections)
-
-	seen := make(map[core.DashboardStandardSection]bool, len(out))
-	for _, entry := range out {
-		seen[entry.ID] = true
-	}
-	for _, entry := range m.defaultWidgetSectionEntries() {
-		if seen[entry.ID] {
-			continue
-		}
-		out = append(out, entry)
-	}
-
-	return out
+	return mergeSections(m.widgetSections, dashboardSectionTrait)
 }
 
 func (m *Model) setWidgetSectionEntries(entries []config.DashboardWidgetSection) {
@@ -680,29 +658,23 @@ func (m *Model) setDetailWidgetSections(entries []config.DetailWidgetSection) {
 	m.invalidateDetailCache()
 }
 
+// detailSectionTrait describes how detail widget sections normalise and
+// order. Unlike dashboard, every known detail section is user-toggleable.
+var detailSectionTrait = sectionTrait[core.DetailStandardSection, config.DetailWidgetSection]{
+	extractID:      func(s config.DetailWidgetSection) core.DetailStandardSection { return s.ID },
+	extractEnabled: func(s config.DetailWidgetSection) bool { return s.Enabled },
+	build: func(id core.DetailStandardSection, enabled bool) config.DetailWidgetSection {
+		return config.DetailWidgetSection{ID: id, Enabled: enabled}
+	},
+	normalizeID: func(id core.DetailStandardSection) core.DetailStandardSection {
+		return core.DetailStandardSection(strings.ToLower(strings.TrimSpace(string(id))))
+	},
+	keepID:     core.IsKnownDetailStandardSection,
+	defaultIDs: core.DefaultDetailSectionOrder,
+}
+
 func normalizeDetailWidgetSectionEntries(entries []config.DetailWidgetSection) []config.DetailWidgetSection {
-	if len(entries) == 0 {
-		return nil
-	}
-
-	out := make([]config.DetailWidgetSection, 0, len(entries))
-	seen := make(map[core.DetailStandardSection]bool, len(entries))
-	for _, entry := range entries {
-		sectionID := core.DetailStandardSection(strings.ToLower(strings.TrimSpace(string(entry.ID))))
-		if !core.IsKnownDetailStandardSection(sectionID) || seen[sectionID] {
-			continue
-		}
-		out = append(out, config.DetailWidgetSection{
-			ID:      sectionID,
-			Enabled: entry.Enabled,
-		})
-		seen[sectionID] = true
-	}
-
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	return normalizeSections(entries, detailSectionTrait)
 }
 
 func (m *Model) applyDetailWidgetSectionOverrides() {
@@ -722,15 +694,7 @@ func (m *Model) applyDetailWidgetSectionOverrides() {
 }
 
 func (m Model) defaultDetailWidgetSectionEntries() []config.DetailWidgetSection {
-	ordered := core.DefaultDetailSectionOrder()
-	entries := make([]config.DetailWidgetSection, 0, len(ordered))
-	for _, section := range ordered {
-		entries = append(entries, config.DetailWidgetSection{
-			ID:      section,
-			Enabled: true,
-		})
-	}
-	return entries
+	return defaultSections(detailSectionTrait)
 }
 
 func (m Model) detailWidgetSectionEntries() []config.DetailWidgetSection {
@@ -738,25 +702,7 @@ func (m Model) detailWidgetSectionEntries() []config.DetailWidgetSection {
 }
 
 func (m Model) resolvedDetailWidgetSectionEntries() []config.DetailWidgetSection {
-	if len(m.detailWidgetSections) == 0 {
-		return m.defaultDetailWidgetSectionEntries()
-	}
-
-	out := make([]config.DetailWidgetSection, len(m.detailWidgetSections))
-	copy(out, m.detailWidgetSections)
-
-	seen := make(map[core.DetailStandardSection]bool, len(out))
-	for _, entry := range out {
-		seen[entry.ID] = true
-	}
-	for _, entry := range m.defaultDetailWidgetSectionEntries() {
-		if seen[entry.ID] {
-			continue
-		}
-		out = append(out, entry)
-	}
-
-	return out
+	return mergeSections(m.detailWidgetSections, detailSectionTrait)
 }
 
 func (m *Model) setDetailWidgetSectionEntries(entries []config.DetailWidgetSection) {
@@ -943,7 +889,14 @@ func (m Model) isProviderEnabled(id string) bool {
 	return enabled
 }
 
+// visibleSnapshots returns the subset of m.snapshots whose providers are
+// enabled in the current dashboard config. Common case is "every provider
+// enabled", which we fast-path by returning m.snapshots directly — saves
+// a per-frame map clone in the most common state.
 func (m Model) visibleSnapshots() map[string]core.UsageSnapshot {
+	if m.allProvidersEnabled() {
+		return m.snapshots
+	}
 	out := make(map[string]core.UsageSnapshot, len(m.snapshots))
 	for id, snap := range m.snapshots {
 		if m.isProviderEnabled(id) {
@@ -951,6 +904,30 @@ func (m Model) visibleSnapshots() map[string]core.UsageSnapshot {
 		}
 	}
 	return out
+}
+
+// viewNow returns the wall-clock time pinned at the start of the current
+// View() pass. Falls back to time.Now() when m.referenceTime is unset (e.g.
+// methods called from non-View paths). This keeps every "X ago" / "since"
+// label inside a single frame consistent and lets tests inject time via
+// referenceTime.
+func (m Model) viewNow() time.Time {
+	if !m.referenceTime.IsZero() {
+		return m.referenceTime
+	}
+	return time.Now()
+}
+
+// allProvidersEnabled reports whether every snapshot's provider is enabled.
+// Cheap O(N) scan; avoids the map allocation in visibleSnapshots when no
+// provider is currently disabled.
+func (m Model) allProvidersEnabled() bool {
+	for id := range m.snapshots {
+		if !m.isProviderEnabled(id) {
+			return false
+		}
+	}
+	return true
 }
 
 func (m *Model) rebuildSortedIDs() {

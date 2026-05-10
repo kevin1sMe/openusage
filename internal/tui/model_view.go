@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/janekbaraniewski/openusage/internal/core"
@@ -13,6 +14,13 @@ func (m Model) View() string {
 		return lipgloss.NewStyle().
 			Foreground(colorDim).
 			Render("\n  Terminal too small. Resize to at least 30×8.")
+	}
+	// Pin the wall-clock once per View() so tile / detail "X ago" labels
+	// use a single consistent timestamp throughout the frame. Also makes
+	// teatest assertions deterministic and gives the render cache a stable
+	// key contribution.
+	if m.referenceTime.IsZero() {
+		m.referenceTime = time.Now()
 	}
 	if !m.hasData {
 		return m.renderSplash(m.width, m.height)

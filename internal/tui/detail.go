@@ -32,12 +32,15 @@ func DetailTabs(snap core.UsageSnapshot) []string {
 	return []string{"All"}
 }
 
-func RenderDetailContent(snap core.UsageSnapshot, w int, warnThresh, critThresh float64, activeTab int, timeWindow core.TimeWindow) string {
+// RenderDetailContent is the pure render function for the detail panel.
+// `now` is the reference time used for "X ago" labels — pass m.viewNow() in
+// production paths, or time.Now() in tests that don't care about pinning.
+func RenderDetailContent(snap core.UsageSnapshot, now time.Time, w int, warnThresh, critThresh float64, activeTab int, timeWindow core.TimeWindow) string {
 	var sb strings.Builder
 	widget := dashboardWidget(snap.ProviderID)
 
 	// ── Compact top bar ──
-	renderDetailCompactHeader(&sb, snap, w)
+	renderDetailCompactHeader(&sb, snap, now, w)
 
 	if len(snap.Metrics) == 0 && len(snap.ModelUsage) == 0 {
 		if snap.Message != "" {
@@ -60,7 +63,7 @@ func RenderDetailContent(snap core.UsageSnapshot, w int, warnThresh, critThresh 
 // ── Compact Header ─────────────────────────────────────────────────────────
 // Replaces the old bordered card header. Shows essential info in 2 lines.
 
-func renderDetailCompactHeader(sb *strings.Builder, snap core.UsageSnapshot, w int) {
+func renderDetailCompactHeader(sb *strings.Builder, snap core.UsageSnapshot, now time.Time, w int) {
 	di := computeDisplayInfo(snap, dashboardWidget(snap.ProviderID))
 
 	// Line 1: status icon + name (left) ... provider + meta + status badge (right)
@@ -104,7 +107,7 @@ func renderDetailCompactHeader(sb *strings.Builder, snap core.UsageSnapshot, w i
 	summaryLeft := "  " + strings.Join(summaryParts, dimStyle.Render("  ·  "))
 
 	timeStr := snap.Timestamp.Format("15:04:05")
-	age := time.Since(snap.Timestamp)
+	age := now.Sub(snap.Timestamp)
 	if age > 60*time.Second {
 		timeStr = fmt.Sprintf("%s (%s ago)", snap.Timestamp.Format("15:04:05"), formatDuration(age))
 	}

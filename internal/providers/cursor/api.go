@@ -9,13 +9,13 @@ import (
 	"net/http"
 )
 
-func (p *Provider) callDashboardAPI(ctx context.Context, token, method string, result interface{}) error {
-	url := fmt.Sprintf("%s/aiserver.v1.DashboardService/%s", cursorAPIBase, method)
+func (p *Provider) callDashboardAPI(ctx context.Context, baseURL, token, method string, result interface{}) error {
+	url := fmt.Sprintf("%s/aiserver.v1.DashboardService/%s", baseURL, method)
 	return p.doPost(ctx, token, url, result)
 }
 
-func (p *Provider) callDashboardAPIWithBody(ctx context.Context, token, method string, body []byte, result interface{}) error {
-	url := fmt.Sprintf("%s/aiserver.v1.DashboardService/%s", cursorAPIBase, method)
+func (p *Provider) callDashboardAPIWithBody(ctx context.Context, baseURL, token, method string, body []byte, result interface{}) error {
+	url := fmt.Sprintf("%s/aiserver.v1.DashboardService/%s", baseURL, method)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -30,15 +30,18 @@ func (p *Provider) callDashboardAPIWithBody(ctx context.Context, token, method s
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("cursor: HTTP %d (body read failed: %w)", resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("cursor: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	return json.NewDecoder(resp.Body).Decode(result)
 }
 
-func (p *Provider) callRESTAPI(ctx context.Context, token, path string, result interface{}) error {
-	url := cursorAPIBase + path
+func (p *Provider) callRESTAPI(ctx context.Context, baseURL, token, path string, result interface{}) error {
+	url := baseURL + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -53,7 +56,10 @@ func (p *Provider) callRESTAPI(ctx context.Context, token, path string, result i
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("cursor: HTTP %d (body read failed: %w)", resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("cursor: HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -75,7 +81,10 @@ func (p *Provider) doPost(ctx context.Context, token, url string, result interfa
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return fmt.Errorf("cursor: HTTP %d (body read failed: %w)", resp.StatusCode, readErr)
+		}
 		return fmt.Errorf("cursor: HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 

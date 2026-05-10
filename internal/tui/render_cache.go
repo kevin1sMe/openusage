@@ -48,7 +48,7 @@ func (m *Model) cachedDetailContent(id string, snap core.UsageSnapshot, w int, a
 		return m.detailCache.content
 	}
 
-	content := RenderDetailContent(snap, w, m.warnThreshold, m.critThreshold, activeTab, m.timeWindow)
+	content := RenderDetailContent(snap, m.viewNow(), w, m.warnThreshold, m.critThreshold, activeTab, m.timeWindow)
 	m.detailCache = detailRenderCacheEntry{
 		key:     key,
 		content: content,

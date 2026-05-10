@@ -38,11 +38,24 @@ type Service struct {
 	dataIngested  atomic.Bool // set when new data is ingested; read model loop skips refresh when clean
 	pollScheduler *PollScheduler
 
-	dirtyProvidersMu sync.Mutex
-	dirtyProviders   map[string]bool // provider IDs that had new data since last read model refresh
-
 	pollStateMu sync.Mutex
 	pollState   map[string]*providerPollState // per-account change detection state
+
+	// clock provides the wall-clock used for snapshot timestamps and any
+	// state that needs to be reproducible in tests. Defaults to
+	// core.SystemClock{}; tests can override via WithClock.
+	clock core.Clock
+}
+
+// now is the canonical "what time is it?" hook for the daemon. Code that
+// stamps snap.Timestamp, persists state, or computes deadlines should call
+// this rather than time.Now(). Pure observability paths (request duration
+// logging) can keep time.Now() — they don't need to be deterministic.
+func (s *Service) now() time.Time {
+	if s.clock != nil {
+		return s.clock.Now()
+	}
+	return time.Now()
 }
 
 func RunServer(cfg Config) error {
@@ -102,17 +115,17 @@ func startService(ctx context.Context, cfg Config) (*Service, error) {
 	}
 
 	svc := &Service{
-		cfg:            cfg,
-		ctx:            ctx,
-		store:          store,
-		pipeline:       telemetry.NewPipeline(store, telemetry.NewSpool(cfg.SpoolDir)),
-		quotaIngest:    telemetry.NewQuotaSnapshotIngestor(store),
-		providerByID:   providersByID(),
-		logThrottle:    core.NewLogThrottle(200, 10*time.Minute),
-		rmCache:        newReadModelCache(),
-		pollScheduler:  newPollScheduler(cfg.PollInterval),
-		pollState:      make(map[string]*providerPollState),
-		dirtyProviders: make(map[string]bool),
+		cfg:           cfg,
+		ctx:           ctx,
+		store:         store,
+		pipeline:      telemetry.NewPipeline(store, telemetry.NewSpool(cfg.SpoolDir)),
+		quotaIngest:   telemetry.NewQuotaSnapshotIngestor(store),
+		providerByID:  providersByID(),
+		logThrottle:   core.NewLogThrottle(200, 10*time.Minute),
+		rmCache:       newReadModelCache(),
+		pollScheduler: newPollScheduler(cfg.PollInterval),
+		pollState:     make(map[string]*providerPollState),
+		clock:         core.SystemClock{},
 	}
 
 	svc.infof(
@@ -211,16 +224,6 @@ func (s *Service) flushBacklog(ctx context.Context, retryReqs []telemetry.Ingest
 	s.spoolMu.Unlock()
 
 	return flush, enqueued, append(warnings, flushWarnings...)
-}
-
-// markProviderDirty records that a provider had new data ingested.
-func (s *Service) markProviderDirty(providerID string) {
-	if providerID == "" {
-		return
-	}
-	s.dirtyProvidersMu.Lock()
-	s.dirtyProviders[providerID] = true
-	s.dirtyProvidersMu.Unlock()
 }
 
 // --- HTTP server ---

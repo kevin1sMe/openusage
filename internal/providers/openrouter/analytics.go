@@ -13,42 +13,61 @@ import (
 	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
+// fetchAnalytics is the orchestrator for OpenRouter's activity analytics.
+// It splits into four phases:
+//
+//  1. discoverActivityEndpoint — try each known activity endpoint until one
+//     returns 200 with a parseable body.
+//  2. aggregateActivity — fold the rows into per-date / per-model /
+//     per-provider / per-endpoint totals.
+//  3. emit*Metrics — translate each aggregate slice into snapshot metrics
+//     and daily-series.
+//
+// Each phase is testable in isolation; before the split this was a single
+// 380-line function.
 func (p *Provider) fetchAnalytics(ctx context.Context, baseURL, apiKey string, snap *core.UsageSnapshot) error {
-	var analytics analyticsResponse
-	var activityEndpoint string
-	var activityCachedAt string
-	forbiddenMsg := ""
-	yesterdayUTC := p.now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	analytics, endpoint, cachedAt, err := p.discoverActivityEndpoint(ctx, baseURL, apiKey)
+	if err != nil {
+		return err
+	}
 
-	for _, endpoint := range []string{
+	snap.Raw["activity_endpoint"] = endpoint
+	if cachedAt != "" {
+		snap.Raw["activity_cached_at"] = cachedAt
+	}
+
+	agg := aggregateActivity(analytics.Data, p.now().UTC())
+	emitActivityRawCounts(snap, len(analytics.Data), agg)
+	emitActivityDailySeries(snap, agg)
+	emitActivityWindowMetrics(snap, agg)
+	emitActivityCardinalityMetrics(snap, agg)
+	emitActivityBreakdowns(snap, agg)
+	emitActivityBYOKWindows(snap, agg)
+	return nil
+}
+
+// discoverActivityEndpoint walks OpenRouter's documented activity endpoints
+// in fallback order and returns the first one that succeeds with a body we
+// can parse. The 403-on-/activity case is special: it usually means the user
+// has only a non-management key, and we surface the underlying message.
+func (p *Provider) discoverActivityEndpoint(ctx context.Context, baseURL, apiKey string) (analyticsResponse, string, string, error) {
+	yesterdayUTC := p.now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	candidates := []string{
 		"/activity",
 		"/activity?date=" + yesterdayUTC,
 		"/analytics/user-activity",
 		"/api/internal/v1/transaction-analytics?window=1mo",
-	} {
-		url := analyticsEndpointURL(baseURL, endpoint)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Cache-Control", "no-cache, no-store, max-age=0")
-		req.Header.Set("Pragma", "no-cache")
+	}
 
-		resp, err := p.Client().Do(req)
+	forbiddenMsg := ""
+	for _, endpoint := range candidates {
+		body, status, err := p.getActivityEndpoint(ctx, baseURL+"", endpoint, apiKey)
 		if err != nil {
-			return err
+			return analyticsResponse{}, "", "", err
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			return err
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
-			if endpoint == "/activity" && resp.StatusCode == http.StatusForbidden {
+		if status == http.StatusUnauthorized || status == http.StatusForbidden || status == http.StatusNotFound {
+			if endpoint == "/activity" && status == http.StatusForbidden {
 				msg := parseAPIErrorMessage(body)
 				if msg == "" {
 					msg = "activity endpoint requires management key"
@@ -57,7 +76,7 @@ func (p *Provider) fetchAnalytics(ctx context.Context, baseURL, apiKey string, s
 			}
 			continue
 		}
-		if resp.StatusCode != http.StatusOK {
+		if status != http.StatusOK {
 			continue
 		}
 
@@ -65,66 +84,131 @@ func (p *Provider) fetchAnalytics(ctx context.Context, baseURL, apiKey string, s
 		if err != nil || !ok {
 			continue
 		}
-		analytics = parsed
-		activityEndpoint = endpoint
-		activityCachedAt = cachedAt
-		break
+		return parsed, endpoint, cachedAt, nil
 	}
 
-	if activityEndpoint == "" {
-		if forbiddenMsg != "" {
-			return fmt.Errorf("%s (HTTP 403)", forbiddenMsg)
-		}
-		return fmt.Errorf("analytics endpoint not available (HTTP 404)")
+	if forbiddenMsg != "" {
+		return analyticsResponse{}, "", "", fmt.Errorf("openrouter: %s (HTTP 403)", forbiddenMsg)
 	}
+	return analyticsResponse{}, "", "", fmt.Errorf("openrouter: analytics endpoint not available (HTTP 404)")
+}
 
-	snap.Raw["activity_endpoint"] = activityEndpoint
-	if activityCachedAt != "" {
-		snap.Raw["activity_cached_at"] = activityCachedAt
+// getActivityEndpoint performs the HTTP GET; returns body + status. URL
+// construction is funnelled through analyticsEndpointURL.
+func (p *Provider) getActivityEndpoint(ctx context.Context, baseURL, endpoint, apiKey string) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, analyticsEndpointURL(baseURL, endpoint), nil)
+	if err != nil {
+		return nil, 0, err
 	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cache-Control", "no-cache, no-store, max-age=0")
+	req.Header.Set("Pragma", "no-cache")
 
-	costByDate := make(map[string]float64)
-	tokensByDate := make(map[string]float64)
-	requestsByDate := make(map[string]float64)
-	byokCostByDate := make(map[string]float64)
-	reasoningTokensByDate := make(map[string]float64)
-	cachedTokensByDate := make(map[string]float64)
-	providerTokensByDate := make(map[string]map[string]float64)
-	providerRequestsByDate := make(map[string]map[string]float64)
-	modelCost := make(map[string]float64)
-	modelByokCost := make(map[string]float64)
-	modelInputTokens := make(map[string]float64)
-	modelOutputTokens := make(map[string]float64)
-	modelReasoningTokens := make(map[string]float64)
-	modelCachedTokens := make(map[string]float64)
-	modelTotalTokens := make(map[string]float64)
-	modelRequests := make(map[string]float64)
-	modelByokRequests := make(map[string]float64)
-	providerCost := make(map[string]float64)
-	providerByokCost := make(map[string]float64)
-	providerInputTokens := make(map[string]float64)
-	providerOutputTokens := make(map[string]float64)
-	providerReasoningTokens := make(map[string]float64)
-	providerRequests := make(map[string]float64)
-	endpointStatsMap := make(map[string]*endpointStats)
-	models := make(map[string]struct{})
-	providers := make(map[string]struct{})
-	endpoints := make(map[string]struct{})
-	activeDays := make(map[string]struct{})
+	resp, err := p.Client().Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return body, resp.StatusCode, nil
+}
 
-	now := p.now().UTC()
+// activityAggregates is the bag of every aggregate the activity loop
+// produces. Held together so each emit* function takes a single argument
+// and the loop stays readable.
+type activityAggregates struct {
+	costByDate             map[string]float64
+	tokensByDate           map[string]float64
+	requestsByDate         map[string]float64
+	byokCostByDate         map[string]float64
+	reasoningTokensByDate  map[string]float64
+	cachedTokensByDate     map[string]float64
+	providerTokensByDate   map[string]map[string]float64
+	providerRequestsByDate map[string]map[string]float64
+
+	modelCost            map[string]float64
+	modelByokCost        map[string]float64
+	modelInputTokens     map[string]float64
+	modelOutputTokens    map[string]float64
+	modelReasoningTokens map[string]float64
+	modelCachedTokens    map[string]float64
+	modelTotalTokens     map[string]float64
+	modelRequests        map[string]float64
+	modelByokRequests    map[string]float64
+
+	providerCost            map[string]float64
+	providerByokCost        map[string]float64
+	providerInputTokens     map[string]float64
+	providerOutputTokens    map[string]float64
+	providerReasoningTokens map[string]float64
+	providerRequests        map[string]float64
+
+	endpointStatsMap map[string]*endpointStats
+	models           map[string]struct{}
+	providers        map[string]struct{}
+	endpoints        map[string]struct{}
+	activeDays       map[string]struct{}
+
+	totalCost, totalByok, totalRequests      float64
+	totalInput, totalOutput, totalReasoning  float64
+	totalCached, totalTokens                 float64
+	cost7d, byok7d, requests7d               float64
+	input7d, output7d, reasoning7d, cached7d float64
+	tokens7d                                 float64
+	todayByok, cost7dByok, cost30dByok       float64
+	minDate, maxDate                         string
+}
+
+func newActivityAggregates() *activityAggregates {
+	return &activityAggregates{
+		costByDate:             make(map[string]float64),
+		tokensByDate:           make(map[string]float64),
+		requestsByDate:         make(map[string]float64),
+		byokCostByDate:         make(map[string]float64),
+		reasoningTokensByDate:  make(map[string]float64),
+		cachedTokensByDate:     make(map[string]float64),
+		providerTokensByDate:   make(map[string]map[string]float64),
+		providerRequestsByDate: make(map[string]map[string]float64),
+
+		modelCost:            make(map[string]float64),
+		modelByokCost:        make(map[string]float64),
+		modelInputTokens:     make(map[string]float64),
+		modelOutputTokens:    make(map[string]float64),
+		modelReasoningTokens: make(map[string]float64),
+		modelCachedTokens:    make(map[string]float64),
+		modelTotalTokens:     make(map[string]float64),
+		modelRequests:        make(map[string]float64),
+		modelByokRequests:    make(map[string]float64),
+
+		providerCost:            make(map[string]float64),
+		providerByokCost:        make(map[string]float64),
+		providerInputTokens:     make(map[string]float64),
+		providerOutputTokens:    make(map[string]float64),
+		providerReasoningTokens: make(map[string]float64),
+		providerRequests:        make(map[string]float64),
+
+		endpointStatsMap: make(map[string]*endpointStats),
+		models:           make(map[string]struct{}),
+		providers:        make(map[string]struct{}),
+		endpoints:        make(map[string]struct{}),
+		activeDays:       make(map[string]struct{}),
+	}
+}
+
+// aggregateActivity folds every analytics row into the bag of aggregates.
+// Pure: no snap/state side effects, no I/O. The `now` param is passed in so
+// tests can pin time without mutating the provider.
+func aggregateActivity(rows []analyticsEntry, now time.Time) *activityAggregates {
+	agg := newActivityAggregates()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 	sevenDaysAgo := now.AddDate(0, 0, -7)
 	thirtyDaysAgo := now.AddDate(0, 0, -30)
 
-	var totalCost, totalByok, totalRequests float64
-	var totalInput, totalOutput, totalReasoning, totalCached, totalTokens float64
-	var cost7d, byok7d, requests7d float64
-	var input7d, output7d, reasoning7d, cached7d, tokens7d float64
-	var todayByok, cost7dByok, cost30dByok float64
-	var minDate, maxDate string
-
-	for _, entry := range analytics.Data {
+	for _, entry := range rows {
 		if entry.Date == "" {
 			continue
 		}
@@ -161,41 +245,41 @@ func (p *Provider) fetchAnalytics(ctx context.Context, baseURL, apiKey string, s
 			endpointID = "unknown"
 		}
 
-		costByDate[date] += cost
-		tokensByDate[date] += tokens
-		requestsByDate[date] += requests
-		byokCostByDate[date] += byokCost
-		reasoningTokensByDate[date] += reasoningTokens
-		cachedTokensByDate[date] += cachedTokens
-		modelCost[modelName] += cost
-		modelByokCost[modelName] += byokCost
-		modelInputTokens[modelName] += inputTokens
-		modelOutputTokens[modelName] += outputTokens
-		modelReasoningTokens[modelName] += reasoningTokens
-		modelCachedTokens[modelName] += cachedTokens
-		modelTotalTokens[modelName] += tokens
-		modelRequests[modelName] += requests
-		modelByokRequests[modelName] += byokRequests
-		providerCost[providerName] += cost
-		providerByokCost[providerName] += byokCost
-		providerInputTokens[providerName] += inputTokens
-		providerOutputTokens[providerName] += outputTokens
-		providerReasoningTokens[providerName] += reasoningTokens
-		providerRequests[providerName] += requests
+		agg.costByDate[date] += cost
+		agg.tokensByDate[date] += tokens
+		agg.requestsByDate[date] += requests
+		agg.byokCostByDate[date] += byokCost
+		agg.reasoningTokensByDate[date] += reasoningTokens
+		agg.cachedTokensByDate[date] += cachedTokens
+		agg.modelCost[modelName] += cost
+		agg.modelByokCost[modelName] += byokCost
+		agg.modelInputTokens[modelName] += inputTokens
+		agg.modelOutputTokens[modelName] += outputTokens
+		agg.modelReasoningTokens[modelName] += reasoningTokens
+		agg.modelCachedTokens[modelName] += cachedTokens
+		agg.modelTotalTokens[modelName] += tokens
+		agg.modelRequests[modelName] += requests
+		agg.modelByokRequests[modelName] += byokRequests
+		agg.providerCost[providerName] += cost
+		agg.providerByokCost[providerName] += byokCost
+		agg.providerInputTokens[providerName] += inputTokens
+		agg.providerOutputTokens[providerName] += outputTokens
+		agg.providerReasoningTokens[providerName] += reasoningTokens
+		agg.providerRequests[providerName] += requests
 		providerClientKey := sanitizeName(strings.ToLower(providerName))
-		if providerTokensByDate[providerClientKey] == nil {
-			providerTokensByDate[providerClientKey] = make(map[string]float64)
+		if agg.providerTokensByDate[providerClientKey] == nil {
+			agg.providerTokensByDate[providerClientKey] = make(map[string]float64)
 		}
-		providerTokensByDate[providerClientKey][date] += inputTokens + outputTokens + reasoningTokens
-		if providerRequestsByDate[providerClientKey] == nil {
-			providerRequestsByDate[providerClientKey] = make(map[string]float64)
+		agg.providerTokensByDate[providerClientKey][date] += inputTokens + outputTokens + reasoningTokens
+		if agg.providerRequestsByDate[providerClientKey] == nil {
+			agg.providerRequestsByDate[providerClientKey] = make(map[string]float64)
 		}
-		providerRequestsByDate[providerClientKey][date] += requests
+		agg.providerRequestsByDate[providerClientKey][date] += requests
 
-		stats := endpointStatsMap[endpointID]
+		stats := agg.endpointStatsMap[endpointID]
 		if stats == nil {
 			stats = &endpointStats{Model: modelName, Provider: providerName}
-			endpointStatsMap[endpointID] = stats
+			agg.endpointStatsMap[endpointID] = stats
 		}
 		stats.Requests += entry.Requests
 		stats.TotalCost += cost
@@ -204,196 +288,207 @@ func (p *Provider) fetchAnalytics(ctx context.Context, baseURL, apiKey string, s
 		stats.CompletionTokens += entry.CompletionTokens
 		stats.ReasoningTokens += entry.ReasoningTokens
 
-		models[modelName] = struct{}{}
-		providers[providerName] = struct{}{}
+		agg.models[modelName] = struct{}{}
+		agg.providers[providerName] = struct{}{}
 		if endpointID != "unknown" {
-			endpoints[endpointID] = struct{}{}
+			agg.endpoints[endpointID] = struct{}{}
 		}
-		activeDays[date] = struct{}{}
+		agg.activeDays[date] = struct{}{}
 
-		if minDate == "" || date < minDate {
-			minDate = date
+		if agg.minDate == "" || date < agg.minDate {
+			agg.minDate = date
 		}
-		if maxDate == "" || date > maxDate {
-			maxDate = date
+		if agg.maxDate == "" || date > agg.maxDate {
+			agg.maxDate = date
 		}
 
-		totalCost += cost
-		totalByok += byokCost
-		totalRequests += requests
-		totalInput += inputTokens
-		totalOutput += outputTokens
-		totalReasoning += reasoningTokens
-		totalCached += cachedTokens
-		totalTokens += tokens
+		agg.totalCost += cost
+		agg.totalByok += byokCost
+		agg.totalRequests += requests
+		agg.totalInput += inputTokens
+		agg.totalOutput += outputTokens
+		agg.totalReasoning += reasoningTokens
+		agg.totalCached += cachedTokens
+		agg.totalTokens += tokens
 
 		if !hasParsedDate {
 			continue
 		}
 		if !entryDate.Before(todayStart) {
-			todayByok += byokCost
+			agg.todayByok += byokCost
 		}
 		if entryDate.After(sevenDaysAgo) {
-			cost7dByok += byokCost
+			agg.cost7dByok += byokCost
 		}
 		if entryDate.After(thirtyDaysAgo) {
-			cost30dByok += byokCost
+			agg.cost30dByok += byokCost
 		}
 		if entryDate.After(sevenDaysAgo) {
-			cost7d += cost
-			byok7d += byokCost
-			requests7d += requests
-			input7d += inputTokens
-			output7d += outputTokens
-			reasoning7d += reasoningTokens
-			cached7d += cachedTokens
-			tokens7d += tokens
+			agg.cost7d += cost
+			agg.byok7d += byokCost
+			agg.requests7d += requests
+			agg.input7d += inputTokens
+			agg.output7d += outputTokens
+			agg.reasoning7d += reasoningTokens
+			agg.cached7d += cachedTokens
+			agg.tokens7d += tokens
 		}
 	}
+	return agg
+}
 
-	snap.Raw["activity_rows"] = fmt.Sprintf("%d", len(analytics.Data))
-	if minDate != "" && maxDate != "" {
-		snap.Raw["activity_date_range"] = minDate + " .. " + maxDate
+// emitActivityRawCounts writes the raw count strings (rows, date range,
+// distinct model/provider/endpoint counts).
+func emitActivityRawCounts(snap *core.UsageSnapshot, rowCount int, agg *activityAggregates) {
+	snap.Raw["activity_rows"] = fmt.Sprintf("%d", rowCount)
+	if agg.minDate != "" && agg.maxDate != "" {
+		snap.Raw["activity_date_range"] = agg.minDate + " .. " + agg.maxDate
 	}
-	if minDate != "" {
-		snap.Raw["activity_min_date"] = minDate
+	if agg.minDate != "" {
+		snap.Raw["activity_min_date"] = agg.minDate
 	}
-	if maxDate != "" {
-		snap.Raw["activity_max_date"] = maxDate
+	if agg.maxDate != "" {
+		snap.Raw["activity_max_date"] = agg.maxDate
 	}
-	if len(models) > 0 {
-		snap.Raw["activity_models"] = fmt.Sprintf("%d", len(models))
+	for _, kv := range []struct {
+		key  string
+		size int
+	}{
+		{"activity_models", len(agg.models)},
+		{"activity_providers", len(agg.providers)},
+		{"activity_endpoints", len(agg.endpoints)},
+		{"activity_days", len(agg.activeDays)},
+	} {
+		if kv.size > 0 {
+			snap.Raw[kv.key] = fmt.Sprintf("%d", kv.size)
+		}
 	}
-	if len(providers) > 0 {
-		snap.Raw["activity_providers"] = fmt.Sprintf("%d", len(providers))
-	}
-	if len(endpoints) > 0 {
-		snap.Raw["activity_endpoints"] = fmt.Sprintf("%d", len(endpoints))
-	}
-	if len(activeDays) > 0 {
-		snap.Raw["activity_days"] = fmt.Sprintf("%d", len(activeDays))
-	}
+}
 
-	if len(costByDate) > 0 {
-		snap.DailySeries["analytics_cost"] = core.SortedTimePoints(costByDate)
+// emitActivityDailySeries writes the per-date time-series slices.
+func emitActivityDailySeries(snap *core.UsageSnapshot, agg *activityAggregates) {
+	for _, kv := range []struct {
+		key string
+		m   map[string]float64
+	}{
+		{"analytics_cost", agg.costByDate},
+		{"analytics_tokens", agg.tokensByDate},
+		{"analytics_requests", agg.requestsByDate},
+		{"analytics_byok_cost", agg.byokCostByDate},
+		{"analytics_reasoning_tokens", agg.reasoningTokensByDate},
+		{"analytics_cached_tokens", agg.cachedTokensByDate},
+	} {
+		if len(kv.m) > 0 {
+			snap.DailySeries[kv.key] = core.SortedTimePoints(kv.m)
+		}
 	}
-	if len(tokensByDate) > 0 {
-		snap.DailySeries["analytics_tokens"] = core.SortedTimePoints(tokensByDate)
-	}
-	if len(requestsByDate) > 0 {
-		snap.DailySeries["analytics_requests"] = core.SortedTimePoints(requestsByDate)
-	}
-	if len(byokCostByDate) > 0 {
-		snap.DailySeries["analytics_byok_cost"] = core.SortedTimePoints(byokCostByDate)
-	}
-	if len(reasoningTokensByDate) > 0 {
-		snap.DailySeries["analytics_reasoning_tokens"] = core.SortedTimePoints(reasoningTokensByDate)
-	}
-	if len(cachedTokensByDate) > 0 {
-		snap.DailySeries["analytics_cached_tokens"] = core.SortedTimePoints(cachedTokensByDate)
-	}
+}
 
-	if totalCost > 0 {
-		snap.Metrics["analytics_30d_cost"] = core.Metric{Used: &totalCost, Unit: "USD", Window: "30d"}
+// emitActivityWindowMetrics writes the 30d and 7d aggregate metrics.
+func emitActivityWindowMetrics(snap *core.UsageSnapshot, agg *activityAggregates) {
+	emit := func(key string, value float64, unit, window string) {
+		if value > 0 {
+			snap.Metrics[key] = core.Metric{Used: &value, Unit: unit, Window: window}
+		}
 	}
-	if totalByok > 0 {
-		snap.Metrics["analytics_30d_byok_cost"] = core.Metric{Used: &totalByok, Unit: "USD", Window: "30d"}
+	if agg.totalByok > 0 {
 		snap.Raw["byok_in_use"] = "true"
 	}
-	if totalRequests > 0 {
-		snap.Metrics["analytics_30d_requests"] = core.Metric{Used: &totalRequests, Unit: "requests", Window: "30d"}
-	}
-	if totalInput > 0 {
-		snap.Metrics["analytics_30d_input_tokens"] = core.Metric{Used: &totalInput, Unit: "tokens", Window: "30d"}
-	}
-	if totalOutput > 0 {
-		snap.Metrics["analytics_30d_output_tokens"] = core.Metric{Used: &totalOutput, Unit: "tokens", Window: "30d"}
-	}
-	if totalReasoning > 0 {
-		snap.Metrics["analytics_30d_reasoning_tokens"] = core.Metric{Used: &totalReasoning, Unit: "tokens", Window: "30d"}
-	}
-	if totalCached > 0 {
-		snap.Metrics["analytics_30d_cached_tokens"] = core.Metric{Used: &totalCached, Unit: "tokens", Window: "30d"}
-	}
-	if totalTokens > 0 {
-		snap.Metrics["analytics_30d_tokens"] = core.Metric{Used: &totalTokens, Unit: "tokens", Window: "30d"}
-	}
+	emit("analytics_30d_cost", agg.totalCost, "USD", "30d")
+	emit("analytics_30d_byok_cost", agg.totalByok, "USD", "30d")
+	emit("analytics_30d_requests", agg.totalRequests, "requests", "30d")
+	emit("analytics_30d_input_tokens", agg.totalInput, "tokens", "30d")
+	emit("analytics_30d_output_tokens", agg.totalOutput, "tokens", "30d")
+	emit("analytics_30d_reasoning_tokens", agg.totalReasoning, "tokens", "30d")
+	emit("analytics_30d_cached_tokens", agg.totalCached, "tokens", "30d")
+	emit("analytics_30d_tokens", agg.totalTokens, "tokens", "30d")
 
-	if cost7d > 0 {
-		snap.Metrics["analytics_7d_cost"] = core.Metric{Used: &cost7d, Unit: "USD", Window: "7d"}
-	}
-	if byok7d > 0 {
-		snap.Metrics["analytics_7d_byok_cost"] = core.Metric{Used: &byok7d, Unit: "USD", Window: "7d"}
+	if agg.byok7d > 0 {
 		snap.Raw["byok_in_use"] = "true"
 	}
-	if requests7d > 0 {
-		snap.Metrics["analytics_7d_requests"] = core.Metric{Used: &requests7d, Unit: "requests", Window: "7d"}
-	}
-	if input7d > 0 {
-		snap.Metrics["analytics_7d_input_tokens"] = core.Metric{Used: &input7d, Unit: "tokens", Window: "7d"}
-	}
-	if output7d > 0 {
-		snap.Metrics["analytics_7d_output_tokens"] = core.Metric{Used: &output7d, Unit: "tokens", Window: "7d"}
-	}
-	if reasoning7d > 0 {
-		snap.Metrics["analytics_7d_reasoning_tokens"] = core.Metric{Used: &reasoning7d, Unit: "tokens", Window: "7d"}
-	}
-	if cached7d > 0 {
-		snap.Metrics["analytics_7d_cached_tokens"] = core.Metric{Used: &cached7d, Unit: "tokens", Window: "7d"}
-	}
-	if tokens7d > 0 {
-		snap.Metrics["analytics_7d_tokens"] = core.Metric{Used: &tokens7d, Unit: "tokens", Window: "7d"}
-	}
+	emit("analytics_7d_cost", agg.cost7d, "USD", "7d")
+	emit("analytics_7d_byok_cost", agg.byok7d, "USD", "7d")
+	emit("analytics_7d_requests", agg.requests7d, "requests", "7d")
+	emit("analytics_7d_input_tokens", agg.input7d, "tokens", "7d")
+	emit("analytics_7d_output_tokens", agg.output7d, "tokens", "7d")
+	emit("analytics_7d_reasoning_tokens", agg.reasoning7d, "tokens", "7d")
+	emit("analytics_7d_cached_tokens", agg.cached7d, "tokens", "7d")
+	emit("analytics_7d_tokens", agg.tokens7d, "tokens", "7d")
+}
 
-	if days := len(activeDays); days > 0 {
-		v := float64(days)
-		snap.Metrics["analytics_active_days"] = core.Metric{Used: &v, Unit: "days", Window: "30d"}
+// emitActivityCardinalityMetrics writes the count-of-distinct metrics
+// (active days, models, providers, endpoints over 30d).
+func emitActivityCardinalityMetrics(snap *core.UsageSnapshot, agg *activityAggregates) {
+	for _, kv := range []struct {
+		key  string
+		size int
+		unit string
+	}{
+		{"analytics_active_days", len(agg.activeDays), "days"},
+		{"analytics_models", len(agg.models), "models"},
+		{"analytics_providers", len(agg.providers), "providers"},
+		{"analytics_endpoints", len(agg.endpoints), "endpoints"},
+	} {
+		if kv.size > 0 {
+			v := float64(kv.size)
+			snap.Metrics[kv.key] = core.Metric{Used: &v, Unit: kv.unit, Window: "30d"}
+		}
 	}
-	if count := len(models); count > 0 {
-		v := float64(count)
-		snap.Metrics["analytics_models"] = core.Metric{Used: &v, Unit: "models", Window: "30d"}
-	}
-	if count := len(providers); count > 0 {
-		v := float64(count)
-		snap.Metrics["analytics_providers"] = core.Metric{Used: &v, Unit: "providers", Window: "30d"}
-	}
-	if count := len(endpoints); count > 0 {
-		v := float64(count)
-		snap.Metrics["analytics_endpoints"] = core.Metric{Used: &v, Unit: "endpoints", Window: "30d"}
-	}
+}
 
-	emitAnalyticsPerModelMetrics(snap, modelCost, modelByokCost, modelInputTokens, modelOutputTokens, modelReasoningTokens, modelCachedTokens, modelTotalTokens, modelRequests, modelByokRequests)
-	filterRouterClientProviders(providerCost, providerByokCost, providerInputTokens, providerOutputTokens, providerReasoningTokens, providerRequests)
-	emitAnalyticsPerProviderMetrics(snap, providerCost, providerByokCost, providerInputTokens, providerOutputTokens, providerReasoningTokens, providerRequests)
-	emitUpstreamProviderMetrics(snap, providerCost, providerInputTokens, providerOutputTokens, providerReasoningTokens, providerRequests)
-	emitAnalyticsEndpointMetrics(snap, endpointStatsMap)
-	for name := range providerTokensByDate {
+// emitActivityBreakdowns writes the per-model, per-provider, per-endpoint,
+// and client-daily-series metrics. Filters out router-client provider names
+// before emission so dashboards don't double-count OpenRouter's own routing.
+func emitActivityBreakdowns(snap *core.UsageSnapshot, agg *activityAggregates) {
+	emitAnalyticsPerModelMetrics(snap,
+		agg.modelCost, agg.modelByokCost,
+		agg.modelInputTokens, agg.modelOutputTokens, agg.modelReasoningTokens, agg.modelCachedTokens,
+		agg.modelTotalTokens, agg.modelRequests, agg.modelByokRequests)
+	filterRouterClientProviders(
+		agg.providerCost, agg.providerByokCost,
+		agg.providerInputTokens, agg.providerOutputTokens, agg.providerReasoningTokens,
+		agg.providerRequests)
+	emitAnalyticsPerProviderMetrics(snap,
+		agg.providerCost, agg.providerByokCost,
+		agg.providerInputTokens, agg.providerOutputTokens, agg.providerReasoningTokens,
+		agg.providerRequests)
+	emitUpstreamProviderMetrics(snap,
+		agg.providerCost,
+		agg.providerInputTokens, agg.providerOutputTokens, agg.providerReasoningTokens,
+		agg.providerRequests)
+	emitAnalyticsEndpointMetrics(snap, agg.endpointStatsMap)
+
+	for name := range agg.providerTokensByDate {
 		if isLikelyRouterClientProviderName(name) {
-			delete(providerTokensByDate, name)
+			delete(agg.providerTokensByDate, name)
 		}
 	}
-	for name := range providerRequestsByDate {
+	for name := range agg.providerRequestsByDate {
 		if isLikelyRouterClientProviderName(name) {
-			delete(providerRequestsByDate, name)
+			delete(agg.providerRequestsByDate, name)
 		}
 	}
-	emitClientDailySeries(snap, providerTokensByDate, providerRequestsByDate)
-	emitModelDerivedToolUsageMetrics(snap, modelRequests, "30d inferred", "inferred_from_model_requests")
+	emitClientDailySeries(snap, agg.providerTokensByDate, agg.providerRequestsByDate)
+	emitModelDerivedToolUsageMetrics(snap, agg.modelRequests, "30d inferred", "inferred_from_model_requests")
+}
 
-	if todayByok > 0 {
-		snap.Metrics["today_byok_cost"] = core.Metric{Used: &todayByok, Unit: "USD", Window: "1d"}
-		snap.Raw["byok_in_use"] = "true"
+// emitActivityBYOKWindows writes the today/7d/30d BYOK cost windows.
+func emitActivityBYOKWindows(snap *core.UsageSnapshot, agg *activityAggregates) {
+	for _, kv := range []struct {
+		key    string
+		value  float64
+		window string
+	}{
+		{"today_byok_cost", agg.todayByok, "1d"},
+		{"7d_byok_cost", agg.cost7dByok, "7d"},
+		{"30d_byok_cost", agg.cost30dByok, "30d"},
+	} {
+		if kv.value > 0 {
+			v := kv.value
+			snap.Metrics[kv.key] = core.Metric{Used: &v, Unit: "USD", Window: kv.window}
+			snap.Raw["byok_in_use"] = "true"
+		}
 	}
-	if cost7dByok > 0 {
-		snap.Metrics["7d_byok_cost"] = core.Metric{Used: &cost7dByok, Unit: "USD", Window: "7d"}
-		snap.Raw["byok_in_use"] = "true"
-	}
-	if cost30dByok > 0 {
-		snap.Metrics["30d_byok_cost"] = core.Metric{Used: &cost30dByok, Unit: "USD", Window: "30d"}
-		snap.Raw["byok_in_use"] = "true"
-	}
-
-	return nil
 }
 
 func analyticsEndpointURL(baseURL, endpoint string) string {

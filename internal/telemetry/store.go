@@ -14,7 +14,16 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/janekbaraniewski/openusage/internal/core"
 )
+
+// telemetryLog is the package-level structured logger used for telemetry's
+// emitted events. Component=telemetry; level/event are the daemon-style
+// pair so dashboards / log greps can consume both daemon and telemetry
+// output uniformly. Keep this as the convention for new log lines added
+// in this package.
+var telemetryLog = core.NewLogger("telemetry")
 
 type Store struct {
 	db  *sql.DB
@@ -265,7 +274,7 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 		if exists > 0 {
 			continue
 		}
-		log.Printf("[migrations] running: %s", r.name)
+		telemetryLog.Infof("migration_run", "name=%q", r.name)
 		start := time.Now()
 		if _, err := s.db.ExecContext(ctx, r.sql); err != nil {
 			return fmt.Errorf("run migration %s: %w", r.name, err)
@@ -273,7 +282,7 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, `INSERT INTO _migrations (name, applied_at) VALUES (?, datetime('now'))`, r.name); err != nil {
 			return fmt.Errorf("record migration %s: %w", r.name, err)
 		}
-		log.Printf("[migrations] completed: %s (%dms)", r.name, time.Since(start).Milliseconds())
+		telemetryLog.Infof("migration_complete", "name=%q duration_ms=%d", r.name, time.Since(start).Milliseconds())
 	}
 	return nil
 }

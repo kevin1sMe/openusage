@@ -165,7 +165,7 @@ func TestRenderDetailContent_AtVariousWidths(t *testing.T) {
 	}
 
 	for _, width := range []int{40, 60, 80, 120} {
-		out := RenderDetailContent(snap, width, 0.3, 0.1, 0, core.TimeWindowAll)
+		out := RenderDetailContent(snap, time.Now(), width, 0.3, 0.1, 0, core.TimeWindowAll)
 		if len(out) == 0 {
 			t.Errorf("empty output at width %d", width)
 		}

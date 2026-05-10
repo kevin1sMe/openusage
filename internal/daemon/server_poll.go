@@ -76,7 +76,7 @@ func (s *Service) pollProviders(ctx context.Context) {
 					snapshot: core.UsageSnapshot{
 						ProviderID: account.Provider,
 						AccountID:  account.ID,
-						Timestamp:  time.Now().UTC(),
+						Timestamp:  s.now().UTC(),
 						Status:     core.StatusError,
 						Message:    fmt.Sprintf("no provider adapter registered for %q (restart/reinstall telemetry daemon if recently added)", account.Provider),
 					},
@@ -113,7 +113,7 @@ func (s *Service) pollProviders(ctx context.Context) {
 				snap = core.UsageSnapshot{
 					ProviderID: account.Provider,
 					AccountID:  account.ID,
-					Timestamp:  time.Now().UTC(),
+					Timestamp:  s.now().UTC(),
 					Status:     core.StatusError,
 					Message:    fetchErr.Error(),
 				}
@@ -127,7 +127,7 @@ func (s *Service) pollProviders(ctx context.Context) {
 			// Record successful fetch for future change detection.
 			s.pollStateMu.Lock()
 			s.pollState[account.ID] = &providerPollState{
-				lastFetchAt: time.Now(),
+				lastFetchAt: s.now(),
 				lastSnap:    snap,
 				hasSnap:     true,
 			}
@@ -164,9 +164,6 @@ func (s *Service) pollProviders(ctx context.Context) {
 	}
 	if ingestErr == nil && len(snapshots) > 0 {
 		s.dataIngested.Store(true)
-		for _, snap := range snapshots {
-			s.markProviderDirty(snap.ProviderID)
-		}
 	}
 
 	durationMs := time.Since(started).Milliseconds()
@@ -203,7 +200,7 @@ func (s *Service) skipUnchangedProvider(provider core.UsageProvider, acct core.A
 		return nil // no previous fetch, must run
 	}
 
-	now := time.Now()
+	now := s.now()
 	if snapshotResetPassed(state.lastSnap, state.lastFetchAt, now) {
 		core.Tracef("[poll] %s/%s: forcing refresh because a reset boundary passed after %s", acct.Provider, acct.ID, state.lastFetchAt.Format(time.RFC3339))
 		return nil
