@@ -30,8 +30,7 @@ updates:
       - dependencies
       - ci
     commit-message:
-      prefix: "ci"
-      include: scope
+      prefix: "ci(actions)"
     groups:
       actions-minor-and-patch:
         update-types:
@@ -50,7 +49,6 @@ updates:
       - website
     commit-message:
       prefix: "deps(website)"
-      include: scope
     groups:
       website-minor-and-patch:
         update-types:
@@ -72,7 +70,6 @@ updates:
       - docs
     commit-message:
       prefix: "deps(docs)"
-      include: scope
     groups:
       docusaurus:
         patterns:
